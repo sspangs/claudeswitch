@@ -26,17 +26,32 @@ clsw current         # -> work
 ## Install
 
 ```sh
+./install.sh
+```
+
+That installs `jq` if it's missing (via Homebrew), symlinks `claudeswitch`
+and `clsw` into `~/.local/bin`, and offers to install the `claude` shell
+wrapper for your shell. Re-running it is safe - the shell-rc block is
+replaced in place, not duplicated.
+
+Flags:
+
+```
+-y, --yes            non-interactive: accept all defaults
+--uninstall          remove symlinks and shell wrapper
+--bin-dir <dir>      install to <dir> instead of ~/.local/bin
+--shell <name>       fish|bash|zsh|none (default: auto-detect from $SHELL)
+```
+
+### Manual install
+
+If you'd rather wire it up yourself:
+
+```sh
 chmod +x claudeswitch
-ln -sf "$PWD/claudeswitch" clsw    # short alias (already set up in this repo)
-
-# Option A: symlink both onto your PATH
 ln -s "$PWD/claudeswitch" ~/.local/bin/claudeswitch
-ln -s "$PWD/clsw"         ~/.local/bin/clsw
-
-# Option B: add this directory to PATH in your shell rc
-# fish:  set -U fish_user_paths $PWD $fish_user_paths
-# bash:  echo "export PATH=\"$PWD:\$PATH\"" >> ~/.bashrc
-# zsh:   echo "export PATH=\"$PWD:\$PATH\"" >> ~/.zshrc
+ln -s "$PWD/claudeswitch" ~/.local/bin/clsw
+# then set up the shell wrapper (see "Auto-switch per directory" below)
 ```
 
 ## Usage
@@ -235,10 +250,8 @@ state.
 ## Uninstall
 
 ```sh
-# remove the wrapper from your shell rc (the function definition)
-# then:
-rm -f ~/.local/bin/claudeswitch ~/.local/bin/clsw
-rm -rf ~/.config/claudeswitch      # removes all saved profiles + mappings
+./install.sh --uninstall           # removes symlinks and the shell wrapper
+rm -rf ~/.config/claudeswitch      # (optional) also remove saved profiles + mappings
 ```
 
 This doesn't touch your Keychain entry or `~/.claude.json`, so your current
