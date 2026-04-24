@@ -1,0 +1,716 @@
+#!/usr/bin/env bash
+# claudeswitch - manage Claude Code CLI logins on macOS, with per-repo
+# auto-switching. Invoke as `claudeswitch` or the short alias `clsw`.
+#
+# Profiles:  ~/.config/claudeswitch/profiles/<name>.json   (mode 0600)
+# Repo map:  ~/.config/claudeswitch/repos.json             (mode 0600)
+# Default:   ~/.config/claudeswitch/default                (mode 0600)
+# Keychain:  service "Claude Code-credentials"
+
+set -euo pipefail
+
+PROG="$(basename "$0")"
+SERVICE="Claude Code-credentials"
+PROFILE_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/claudeswitch"
+PROFILE_DIR="$PROFILE_ROOT/profiles"
+MAP_FILE="$PROFILE_ROOT/repos.json"
+DEFAULT_FILE="$PROFILE_ROOT/default"
+CLAUDE_JSON="$HOME/.claude.json"
+SENTINEL_UNMANAGED="-"
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+info() { printf '[%s] %s\n' "$PROG" "$*" >&2; }
+
+require() {
+  command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+}
+
+require jq
+require security
+require shasum
+
+mkdir -p "$PROFILE_DIR"
+chmod 700 "$PROFILE_ROOT" "$PROFILE_DIR" 2>/dev/null || true
+
+# --- keychain --------------------------------------------------------------
+
+keychain_read() {
+  security find-generic-password -s "$SERVICE" -w 2>/dev/null
+}
+
+keychain_account() {
+  security find-generic-password -s "$SERVICE" 2>/dev/null \
+    | awk -F'"' '/"acct"<blob>=/{print $4; exit}'
+}
+
+keychain_write() {
+  local blob="$1" acct
+  acct="$(keychain_account 2>/dev/null || true)"
+  acct="${acct:-$USER}"
+  security add-generic-password -s "$SERVICE" -a "$acct" -w "$blob" -U >/dev/null
+}
+
+# --- profiles --------------------------------------------------------------
+
+valid_name() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || die "invalid profile name: '$1' (use letters, digits, dot, dash, underscore)"
+}
+
+profile_path()  { printf '%s/%s.json' "$PROFILE_DIR" "$1"; }
+profile_blob()  { jq -r '.blob'         "$1"; }
+profile_email() { jq -r '.email // ""'  "$1"; }
+profile_tier()  { jq -r '.tier  // "?"' "$1"; }
+
+blob_fingerprint() {
+  jq -r '.claudeAiOauth.refreshToken // .claudeAiOauth.accessToken // empty' \
+    | shasum | cut -c1-12
+}
+
+current_email_from_claude_json() {
+  [ -f "$CLAUDE_JSON" ] || return 0
+  jq -r '.oauthAccount.emailAddress // ""' "$CLAUDE_JSON" 2>/dev/null || true
+}
+
+# Capture the account-identity subtree of ~/.claude.json. Claude Code caches
+# "who am I" here, so a Keychain swap alone isn't enough - we also have to
+# splice these fields back on `use`. Keep this list minimal; add more only
+# when a stale field causes a visible bug.
+identity_from_claude_json() {
+  [ -f "$CLAUDE_JSON" ] || { printf 'null'; return; }
+  jq -c '{
+    userID: .userID,
+    oauthAccount: .oauthAccount,
+    hasAvailableSubscription: .hasAvailableSubscription
+  }' "$CLAUDE_JSON" 2>/dev/null || printf 'null'
+}
+
+splice_identity_into_claude_json() {
+  local identity="$1" tmp
+  [ -f "$CLAUDE_JSON" ] || return 0
+  [ -n "$identity" ] && [ "$identity" != "null" ] || return 0
+  tmp="$(mktemp)"
+  jq --argjson id "$identity" '
+    (if $id.userID then .userID = $id.userID else . end)
+    | (if $id.oauthAccount then .oauthAccount = $id.oauthAccount else . end)
+    | (if $id.hasAvailableSubscription != null
+         then .hasAvailableSubscription = $id.hasAvailableSubscription
+         else . end)
+  ' "$CLAUDE_JSON" > "$tmp"
+  mv "$tmp" "$CLAUDE_JSON"
+  chmod 600 "$CLAUDE_JSON"
+}
+
+list_profile_names() {
+  shopt -s nullglob
+  local f
+  for f in "$PROFILE_DIR"/*.json; do
+    basename "$f" .json
+  done
+}
+
+active_profile_name() {
+  local active active_fp name fp
+  active="$(keychain_read 2>/dev/null || true)"
+  [ -n "$active" ] || return 0
+  active_fp="$(printf '%s' "$active" | blob_fingerprint)"
+  shopt -s nullglob
+  for f in "$PROFILE_DIR"/*.json; do
+    name="$(basename "$f" .json)"
+    fp="$(profile_blob "$f" | blob_fingerprint)"
+    if [ "$fp" = "$active_fp" ]; then
+      echo "$name"
+      return
+    fi
+  done
+}
+
+# --- repo map & default ----------------------------------------------------
+
+get_mapping_exact() {
+  local dir="$1"
+  [ -f "$MAP_FILE" ] || return 0
+  jq -r --arg k "$dir" 'if has($k) then .[$k] else "" end' "$MAP_FILE"
+}
+
+find_mapping() {
+  # Walk upward from $1 until we find a mapping. Echo "<dir>|<value>" or nothing.
+  local dir="$1" val
+  while :; do
+    val="$(get_mapping_exact "$dir")"
+    if [ -n "$val" ]; then
+      printf '%s|%s\n' "$dir" "$val"
+      return
+    fi
+    [ "$dir" = "/" ] && return
+    dir="$(dirname "$dir")"
+  done
+}
+
+set_mapping() {
+  local dir="$1" val="$2" tmp
+  if [ ! -f "$MAP_FILE" ]; then
+    ( umask 077; printf '{}\n' > "$MAP_FILE" )
+  fi
+  tmp="$(mktemp)"
+  jq --arg k "$dir" --arg v "$val" '.[$k] = $v' "$MAP_FILE" > "$tmp"
+  mv "$tmp" "$MAP_FILE"
+  chmod 600 "$MAP_FILE"
+}
+
+unset_mapping() {
+  local dir="$1" tmp
+  [ -f "$MAP_FILE" ] || return 0
+  tmp="$(mktemp)"
+  jq --arg k "$dir" 'del(.[$k])' "$MAP_FILE" > "$tmp"
+  mv "$tmp" "$MAP_FILE"
+  chmod 600 "$MAP_FILE"
+}
+
+get_default() {
+  [ -f "$DEFAULT_FILE" ] || return 0
+  tr -d '\n' < "$DEFAULT_FILE"
+}
+
+set_default() {
+  ( umask 077; printf '%s\n' "$1" > "$DEFAULT_FILE" )
+}
+
+clear_default() { rm -f "$DEFAULT_FILE"; }
+
+abs_dir() {
+  local d="${1:-$PWD}"
+  if [ -d "$d" ]; then
+    ( cd "$d" && pwd -P )
+  else
+    # Best-effort for paths that don't exist - normalize without resolving.
+    python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$d" 2>/dev/null || echo "$d"
+  fi
+}
+
+# --- internal: switch if needed -------------------------------------------
+
+ensure_active() {
+  local want="$1" cur
+  [ -f "$(profile_path "$want")" ] || {
+    info "warning: profile '$want' is missing; run '$PROG save $want' (or unlink)"
+    return 0
+  }
+  cur="$(active_profile_name)"
+  [ "$cur" = "$want" ] && return 0
+  cmd_use "$want" >/dev/null
+  info "switched to profile: $want"
+}
+
+# --- prompt flow (used by `ensure` and `link` w/o arg) ---------------------
+
+prompt_pick_profile() {
+  # Prints chosen profile name to stdout, or empty if cancelled.
+  # $1 = label for the prompt header (e.g. "default profile").
+  local label="$1"
+  local names=() i=1 name email
+  while IFS= read -r name; do names+=("$name"); done < <(list_profile_names)
+
+  if [ ${#names[@]} -eq 0 ]; then
+    echo "" >&2
+    echo "no saved profiles yet. run '$PROG add <name>' first." >&2
+    return 1
+  fi
+
+  echo "" >&2
+  echo "pick a $label:" >&2
+  for name in "${names[@]}"; do
+    email="$(profile_email "$(profile_path "$name")")"
+    if [ -n "$email" ]; then
+      printf '  %d) %s  (%s)\n' "$i" "$name" "$email" >&2
+    else
+      printf '  %d) %s\n' "$i" "$name" >&2
+    fi
+    i=$((i+1))
+  done
+
+  local choice
+  while :; do
+    printf 'choose [1-%d, or q to cancel]: ' "${#names[@]}" >&2
+    IFS= read -r choice </dev/tty || return 1
+    if [ "$choice" = "q" ] || [ "$choice" = "Q" ]; then
+      return 1
+    fi
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#names[@]}" ]; then
+      echo "${names[$((choice-1))]}"
+      return 0
+    fi
+    echo "invalid choice." >&2
+  done
+}
+
+prompt_new_profile_flow() {
+  # Prompt for a name, run login under bypass, save as that name.
+  # Echoes the new profile name on success; returns 1 on cancel.
+  local name
+  while :; do
+    printf 'name for the new profile (letters/digits/.-_): ' >&2
+    IFS= read -r name </dev/tty || return 1
+    [ -z "$name" ] && return 1
+    if [[ ! "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      echo "invalid name." >&2; continue
+    fi
+    if [ -e "$(profile_path "$name")" ]; then
+      echo "profile '$name' already exists - pick another name." >&2; continue
+    fi
+    break
+  done
+
+  echo "" >&2
+  echo "I'll launch Claude Code now (wrapper bypassed)." >&2
+  echo "  1. In Claude Code, run:  /logout" >&2
+  echo "  2. Then:                 /login  (sign in as the NEW account)" >&2
+  echo "  3. Then quit Claude Code (Ctrl-C or /exit)" >&2
+  printf 'press Enter to continue... ' >&2
+  IFS= read -r _ </dev/tty || true
+
+  CLAUDE_SWITCH_BYPASS=1 command claude || true
+
+  # Save whatever's now in the keychain as this profile.
+  local blob
+  blob="$(keychain_read)" || { echo "no login was completed; aborting." >&2; return 1; }
+  [ -n "$blob" ] || { echo "Keychain entry is empty; aborting." >&2; return 1; }
+
+  # Guard: don't collide with an existing profile's fingerprint.
+  local new_fp cur_name
+  new_fp="$(printf '%s' "$blob" | blob_fingerprint)"
+  shopt -s nullglob
+  for f in "$PROFILE_DIR"/*.json; do
+    if [ "$(profile_blob "$f" | blob_fingerprint)" = "$new_fp" ]; then
+      cur_name="$(basename "$f" .json)"
+      echo "that looks like the same account as profile '$cur_name' - not saving a duplicate." >&2
+      echo "$cur_name"
+      return 0
+    fi
+  done
+
+  cmd_save "$name" >/dev/null
+  echo "$name"
+}
+
+prompt_and_resolve() {
+  # Called by ensure when no mapping and no default.
+  # On success: sets mapping/default, ensures active profile, returns 0.
+  # On cancel: returns 1 (so wrapper aborts `claude`).
+  local target="$1"
+  local names=() name email i
+  while IFS= read -r name; do names+=("$name"); done < <(list_profile_names)
+
+  echo "" >&2
+  echo "[$PROG] no Claude profile set for: $target" >&2
+  echo "" >&2
+
+  i=1
+  for name in "${names[@]}"; do
+    email="$(profile_email "$(profile_path "$name")")"
+    if [ -n "$email" ]; then
+      printf '  %d) use %s  (%s)\n' "$i" "$name" "$email" >&2
+    else
+      printf '  %d) use %s\n' "$i" "$name" >&2
+    fi
+    i=$((i+1))
+  done
+  local add_idx=$i
+  printf '  %d) add a new profile (log in as another account)\n' "$add_idx" >&2
+  local skip_idx=$((i+1))
+  printf '  %d) do not manage this directory\n' "$skip_idx" >&2
+  local default_idx=$((i+2))
+  printf '  %d) set a default profile for all unmanaged dirs\n' "$default_idx" >&2
+
+  local choice
+  while :; do
+    printf 'choose [1-%d, or q to cancel]: ' "$default_idx" >&2
+    IFS= read -r choice </dev/tty || return 1
+    if [ "$choice" = "q" ] || [ "$choice" = "Q" ]; then
+      return 1
+    fi
+    [[ "$choice" =~ ^[0-9]+$ ]] || { echo "invalid choice." >&2; continue; }
+
+    if [ "$choice" -ge 1 ] && [ "$choice" -lt "$add_idx" ]; then
+      local picked="${names[$((choice-1))]}"
+      set_mapping "$target" "$picked"
+      info "linked $target -> $picked"
+      ensure_active "$picked"
+      return 0
+    elif [ "$choice" -eq "$add_idx" ]; then
+      local new_name
+      new_name="$(prompt_new_profile_flow)" || return 1
+      set_mapping "$target" "$new_name"
+      info "linked $target -> $new_name"
+      ensure_active "$new_name"
+      return 0
+    elif [ "$choice" -eq "$skip_idx" ]; then
+      set_mapping "$target" "$SENTINEL_UNMANAGED"
+      info "marked $target as unmanaged"
+      return 0
+    elif [ "$choice" -eq "$default_idx" ]; then
+      local picked
+      picked="$(prompt_pick_profile "default profile")" || continue
+      set_default "$picked"
+      info "default profile set to: $picked"
+      ensure_active "$picked"
+      return 0
+    else
+      echo "invalid choice." >&2
+    fi
+  done
+}
+
+# --- commands --------------------------------------------------------------
+
+cmd_save() {
+  [ $# -eq 1 ] || die "usage: $PROG save <name>"
+  valid_name "$1"
+  local name="$1" path blob email tier envelope saved_at
+  path="$(profile_path "$name")"
+
+  blob="$(keychain_read)" || die "no active Claude Code login found in Keychain - run 'claude' and sign in first"
+  [ -n "$blob" ] || die "Keychain entry is empty"
+
+  email="$(current_email_from_claude_json)"
+  tier="$(printf '%s' "$blob" | jq -r '.claudeAiOauth.subscriptionType // "?"')"
+  saved_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local identity
+  identity="$(identity_from_claude_json)"
+
+  if [ -e "$path" ]; then
+    printf "profile '%s' already exists - overwrite? [y/N] " "$name"
+    IFS= read -r yn
+    [[ "$yn" =~ ^[Yy]$ ]] || { echo "aborted"; exit 1; }
+  fi
+
+  envelope="$(jq -n \
+    --arg blob "$blob" \
+    --arg email "$email" \
+    --arg tier "$tier" \
+    --arg saved_at "$saved_at" \
+    --argjson identity "$identity" \
+    '{blob: $blob, email: $email, tier: $tier, saved_at: $saved_at, identity: $identity}')"
+
+  ( umask 077; printf '%s\n' "$envelope" > "$path" )
+  printf 'saved profile: %s' "$name"
+  [ -n "$email" ] && printf ' (%s)' "$email"
+  printf '\n'
+}
+
+cmd_use() {
+  [ $# -eq 1 ] || die "usage: $PROG use <name>"
+  valid_name "$1"
+  local path blob identity
+  path="$(profile_path "$1")"
+  [ -f "$path" ] || die "no such profile: $1"
+  blob="$(profile_blob "$path")"
+  [ -n "$blob" ] && [ "$blob" != "null" ] || die "profile '$1' is missing a blob (corrupt file?)"
+
+  keychain_write "$blob"
+
+  identity="$(jq -c '.identity // null' "$path")"
+  if [ "$identity" = "null" ]; then
+    info "profile '$1' has no identity snapshot - ~/.claude.json won't be updated."
+    info "re-run '$PROG save $1' while signed in as that account to capture identity."
+  else
+    splice_identity_into_claude_json "$identity"
+  fi
+
+  printf 'switched to profile: %s\n' "$1"
+}
+
+cmd_current() {
+  local name
+  name="$(active_profile_name)"
+  if [ -z "$name" ]; then
+    local blob
+    blob="$(keychain_read 2>/dev/null || true)"
+    if [ -z "$blob" ]; then
+      echo "no active login"
+    else
+      echo "(unsaved - run '$PROG save <name>' to track it)"
+    fi
+    return
+  fi
+  echo "$name"
+}
+
+cmd_list() {
+  local active_fp=""
+  local active_name
+  active_name="$(active_profile_name)"
+  if [ -n "$active_name" ]; then
+    active_fp="$(profile_blob "$(profile_path "$active_name")" | blob_fingerprint)"
+  fi
+
+  local default_name
+  default_name="$(get_default)"
+
+  shopt -s nullglob
+  local files=("$PROFILE_DIR"/*.json)
+  if [ ${#files[@]} -eq 0 ]; then
+    echo "no saved profiles - run '$PROG add <name>' or '$PROG save <name>'"
+    return
+  fi
+
+  printf '  %-2s %-20s %-32s %-8s %-8s\n' '' 'NAME' 'EMAIL' 'TIER' 'FLAGS'
+  local f name email tier fp mark flags
+  for f in "${files[@]}"; do
+    name="$(basename "$f" .json)"
+    email="$(profile_email "$f")"
+    tier="$(profile_tier "$f")"
+    fp="$(profile_blob "$f" | blob_fingerprint)"
+    mark=' '
+    [ -n "$active_fp" ] && [ "$fp" = "$active_fp" ] && mark='*'
+    flags=''
+    [ "$name" = "$default_name" ] && flags='default'
+    printf '  %-2s %-20s %-32s %-8s %-8s\n' "$mark" "$name" "${email:--}" "$tier" "$flags"
+  done
+}
+
+cmd_rm() {
+  [ $# -eq 1 ] || die "usage: $PROG rm <name>"
+  valid_name "$1"
+  local path
+  path="$(profile_path "$1")"
+  [ -f "$path" ] || die "no such profile: $1"
+  rm -f -- "$path"
+  # Clean up references.
+  if [ "$(get_default)" = "$1" ]; then
+    clear_default
+    info "cleared default (was $1)"
+  fi
+  if [ -f "$MAP_FILE" ]; then
+    local tmp
+    tmp="$(mktemp)"
+    jq --arg v "$1" 'with_entries(select(.value != $v))' "$MAP_FILE" > "$tmp"
+    mv "$tmp" "$MAP_FILE"
+    chmod 600 "$MAP_FILE"
+  fi
+  printf 'removed profile: %s\n' "$1"
+}
+
+cmd_link() {
+  local target profile
+  if [ $# -eq 0 ]; then
+    target="$(abs_dir "$PWD")"
+    profile="$(prompt_pick_profile "profile to link to $target")" || { echo "cancelled"; return 1; }
+  elif [ $# -eq 1 ]; then
+    target="$(abs_dir "$PWD")"
+    profile="$1"
+  elif [ $# -eq 2 ]; then
+    target="$(abs_dir "$2")"
+    profile="$1"
+  else
+    die "usage: $PROG link [<profile> [<dir>]]"
+  fi
+  valid_name "$profile"
+  [ -f "$(profile_path "$profile")" ] || die "no such profile: $profile"
+  set_mapping "$target" "$profile"
+  printf 'linked %s -> %s\n' "$target" "$profile"
+}
+
+cmd_unlink() {
+  local target
+  target="$(abs_dir "${1:-$PWD}")"
+  [ -f "$MAP_FILE" ] || { echo "no mappings."; return; }
+  local cur
+  cur="$(get_mapping_exact "$target")"
+  if [ -z "$cur" ]; then
+    echo "no mapping for: $target"
+    return
+  fi
+  unset_mapping "$target"
+  printf 'unlinked %s (was %s)\n' "$target" "$cur"
+}
+
+cmd_which() {
+  local target
+  target="$(abs_dir "${1:-$PWD}")"
+  local hit dir val default_name
+  hit="$(find_mapping "$target")"
+  default_name="$(get_default)"
+
+  if [ -n "$hit" ]; then
+    dir="${hit%%|*}"
+    val="${hit#*|}"
+    if [ "$val" = "$SENTINEL_UNMANAGED" ]; then
+      printf '(unmanaged - mapped at %s)\n' "$dir"
+    else
+      if [ "$dir" = "$target" ]; then
+        printf '%s (linked)\n' "$val"
+      else
+        printf '%s (inherited from %s)\n' "$val" "$dir"
+      fi
+    fi
+    return
+  fi
+  if [ -n "$default_name" ]; then
+    printf '%s (default)\n' "$default_name"
+    return
+  fi
+  echo "(no mapping, no default - would prompt on next 'claude')"
+}
+
+cmd_default() {
+  if [ $# -eq 0 ]; then
+    local d
+    d="$(get_default)"
+    if [ -n "$d" ]; then echo "$d"; else echo "(no default set)"; fi
+    return
+  fi
+  if [ "$1" = "--clear" ]; then
+    clear_default
+    echo "default cleared"
+    return
+  fi
+  valid_name "$1"
+  [ -f "$(profile_path "$1")" ] || die "no such profile: $1"
+  set_default "$1"
+  printf 'default profile set to: %s\n' "$1"
+}
+
+cmd_add() {
+  [ $# -eq 1 ] || die "usage: $PROG add <name>"
+  valid_name "$1"
+  local name="$1"
+  [ -e "$(profile_path "$name")" ] && die "profile '$name' already exists"
+
+  echo "I'll launch Claude Code now (wrapper bypassed)."
+  echo "  1. /logout"
+  echo "  2. /login as the NEW account"
+  echo "  3. quit Claude Code"
+  printf 'press Enter to continue... '
+  IFS= read -r _ </dev/tty || true
+
+  CLAUDE_SWITCH_BYPASS=1 command claude || true
+
+  local blob
+  blob="$(keychain_read)" || die "no login was completed"
+  [ -n "$blob" ] || die "Keychain entry is empty"
+  cmd_save "$name"
+}
+
+cmd_ensure() {
+  local target
+  target="$(abs_dir "${1:-$PWD}")"
+
+  local hit
+  hit="$(find_mapping "$target")"
+  if [ -n "$hit" ]; then
+    local val="${hit#*|}"
+    if [ "$val" = "$SENTINEL_UNMANAGED" ]; then
+      return 0
+    fi
+    if [ ! -f "$(profile_path "$val")" ]; then
+      info "mapping points to missing profile '$val'; falling through"
+    else
+      ensure_active "$val"
+      return 0
+    fi
+  fi
+
+  local default_name
+  default_name="$(get_default)"
+  if [ -n "$default_name" ] && [ -f "$(profile_path "$default_name")" ]; then
+    ensure_active "$default_name"
+    return 0
+  fi
+
+  prompt_and_resolve "$target"
+}
+
+cmd_init_shell() {
+  local shell="${1:-}"
+  case "$shell" in
+    fish)
+      cat <<'EOF'
+function claude --description 'claude with claudeswitch per-repo auto-switching'
+    if set -q CLAUDE_SWITCH_BYPASS
+        command claude $argv
+        return
+    end
+    if command -q claudeswitch
+        if not claudeswitch ensure
+            return 1
+        end
+    end
+    command claude $argv
+end
+EOF
+      ;;
+    bash|zsh)
+      cat <<'EOF'
+claude() {
+  if [ -n "${CLAUDE_SWITCH_BYPASS:-}" ]; then
+    command claude "$@"
+    return
+  fi
+  if command -v claudeswitch >/dev/null 2>&1; then
+    claudeswitch ensure || return 1
+  fi
+  command claude "$@"
+}
+EOF
+      ;;
+    *)
+      die "usage: $PROG init-shell <fish|bash|zsh>"
+      ;;
+  esac
+}
+
+cmd_help() {
+  cat <<EOF
+$PROG - manage Claude Code CLI logins (alias: clsw)
+
+profile management:
+  $PROG save <name>            snapshot the current login as <name>
+  $PROG add  <name>            log in as a new account, then save it as <name>
+  $PROG use  <name>            make <name> the active login
+  $PROG list                   list saved profiles (marks active with *)
+  $PROG current                print the name of the active profile
+  $PROG rm <name>              delete a saved profile
+
+per-directory auto-switching:
+  $PROG link [<profile> [dir]] link current (or given) dir to a profile
+  $PROG unlink [<dir>]         remove mapping for current (or given) dir
+  $PROG which [<dir>]          show the effective profile for a dir
+  $PROG default [<name>]       show / set the fallback profile
+  $PROG default --clear        clear the fallback profile
+  $PROG ensure                 internal: used by the shell wrapper
+  $PROG init-shell <fish|bash|zsh>
+                               print a 'claude' shell wrapper to eval
+
+state:
+  profiles: $PROFILE_DIR
+  repo map: $MAP_FILE
+  default:  $DEFAULT_FILE
+  keychain: service "$SERVICE"
+
+the wrapper will prompt the first time you run \`claude\` in an
+unmanaged directory. set \$CLAUDE_SWITCH_BYPASS=1 to skip the wrapper.
+existing \`claude\` sessions must be restarted to pick up a switch.
+EOF
+}
+
+# --- dispatch --------------------------------------------------------------
+
+cmd="${1:-help}"
+shift || true
+case "$cmd" in
+  save)               cmd_save       "$@" ;;
+  add)                cmd_add        "$@" ;;
+  use|switch)         cmd_use        "$@" ;;
+  list|ls)            cmd_list       "$@" ;;
+  current|who)        cmd_current    "$@" ;;
+  rm|remove|delete)   cmd_rm         "$@" ;;
+  link)               cmd_link       "$@" ;;
+  unlink)             cmd_unlink     "$@" ;;
+  which)              cmd_which      "$@" ;;
+  default)            cmd_default    "$@" ;;
+  ensure)             cmd_ensure     "$@" ;;
+  init-shell)         cmd_init_shell "$@" ;;
+  help|-h|--help)     cmd_help            ;;
+  *) die "unknown command: '$cmd' (try '$PROG help')" ;;
+esac
