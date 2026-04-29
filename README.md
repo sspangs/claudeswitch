@@ -1,8 +1,9 @@
 # claudeswitch
 
-A tiny macOS CLI for juggling multiple Claude Code logins - e.g. a personal
+A tiny CLI for juggling multiple Claude Code logins - e.g. a personal
 Claude Max account and a work one - without having to `/logout` and
-re-authenticate every time.
+re-authenticate every time. Works on macOS, Linux, and Windows (via Git
+Bash or WSL).
 
 Save each login once, then swap between them in a single command. Optionally
 set up a shell wrapper so each repo auto-picks the right account the first
@@ -19,9 +20,13 @@ clsw current         # -> work
 
 ## Requirements
 
-- macOS (uses the system Keychain via `security`)
-- `bash` 3.2+ (ships with macOS)
-- [`jq`](https://jqlang.github.io/jq/) - install with `brew install jq`
+- A POSIX shell: macOS, Linux, or Windows via Git Bash / WSL
+- `bash` 3.2+
+- [`jq`](https://jqlang.github.io/jq/)
+
+Credentials live wherever Claude Code keeps them on your platform: the
+macOS Keychain on macOS, or `~/.claude/.credentials.json` on Linux and
+Windows. See [How it works](#how-it-works) for details.
 
 ## Install
 
@@ -29,10 +34,11 @@ clsw current         # -> work
 ./install.sh
 ```
 
-That installs `jq` if it's missing (via Homebrew), symlinks `claudeswitch`
-and `clsw` into `~/.local/bin`, and offers to install the `claude` shell
-wrapper for your shell. Re-running it is safe - the shell-rc block is
-replaced in place, not duplicated.
+That checks for `jq` (offers to `brew install` it on macOS, prints a
+package-manager hint elsewhere), symlinks `claudeswitch` and `clsw` into
+`~/.local/bin`, and offers to install the `claude` shell wrapper for your
+shell. Re-running it is safe - the shell-rc block is replaced in place,
+not duplicated.
 
 Flags:
 
@@ -190,20 +196,26 @@ directory.
 
 ## How it works
 
-Claude Code stores its OAuth credentials as a single JSON blob in the macOS
-Keychain under the service name **`Claude Code-credentials`**. That blob -
-not a config file - is what defines "who you're signed in as."
+Claude Code stores its OAuth credentials as a single JSON blob. That blob -
+not a config file - is what defines "who you're signed in as." Where the
+blob lives depends on your platform, and `claudeswitch` reads and writes
+from the same place Claude Code does:
 
-- `save <name>` reads that blob with `security find-generic-password` and
-  writes it to `~/.config/claudeswitch/profiles/<name>.json` (mode `0600`),
-  along with an identity snapshot from `~/.claude.json` (`userID`,
-  `oauthAccount`, `hasAvailableSubscription`). The snapshot is needed
-  because Claude Code caches "who am I" in `~/.claude.json` and trusts
-  that cache over the Keychain for things like the displayed email and
-  subscription state.
-- `use <name>` writes the saved blob back into the Keychain
-  (`security add-generic-password -U`) AND splices the saved identity
-  subtree back into `~/.claude.json` so the UI matches the token.
+- **macOS:** the system Keychain, service `Claude Code-credentials`
+- **Linux / Windows:** `~/.claude/.credentials.json` (mode `0600`)
+
+What each command does:
+
+- `save <name>` reads the live blob and writes it to
+  `~/.config/claudeswitch/profiles/<name>.json` (mode `0600`), along with
+  an identity snapshot from `~/.claude.json` (`userID`, `oauthAccount`,
+  `hasAvailableSubscription`). The snapshot is needed because Claude Code
+  caches "who am I" in `~/.claude.json` and trusts that cache over the
+  credential store for things like the displayed email and subscription
+  state.
+- `use <name>` writes the saved blob into the credential store and splices
+  the saved identity subtree back into `~/.claude.json` so the UI matches
+  the token.
 - `current` / `list` identify the active profile by hashing the refresh
   token and matching against saved profiles.
 - `ensure` (called by the shell wrapper) walks up from the cwd looking for
@@ -224,14 +236,14 @@ state.
 ## Caveats
 
 - **Restart `claude` after switching.** A running session holds its tokens
-  in memory and won't notice the Keychain change until it's restarted.
+  in memory and won't notice the credential change until it's restarted.
 - **Profile files contain live OAuth tokens.** They're written with mode
   `0600`, but treat `~/.config/claudeswitch/` the same way you'd treat
   `~/.ssh/` - don't commit it, don't sync it to places you don't trust.
 - **Refresh tokens rotate.** After enough time, a saved profile's
-  fingerprint may stop matching the live Keychain, so `list` won't show a
-  `*`. If that happens, just `clsw save <name>` again while that account
-  is active - it's cheap and re-snaps the fingerprint.
+  fingerprint may stop matching the live credential store, so `list` won't
+  show a `*`. If that happens, just `clsw save <name>` again while that
+  account is active - it's cheap and re-snaps the fingerprint.
 - **macOS may prompt for Keychain access** the first time the script reads
   or writes the entry from a new terminal. Click "Always Allow" to skip
   future prompts.
@@ -239,13 +251,14 @@ state.
   config dir so cloning a shared repo on a new machine won't silently pull
   in someone else's work/personal labels. The tradeoff: you re-link on a
   fresh machine.
-- **First `save` requires you to be signed in.** If the Keychain entry is
-  empty, `save` fails with a clear message - sign in with `claude` first.
+- **First `save` requires you to be signed in.** If the credential store
+  is empty, `save` fails with a clear message - sign in with `claude`
+  first.
 - **Only save right after `/login`.** `save` captures whatever is
-  currently in the Keychain AND whatever identity is currently cached in
-  `~/.claude.json`. Those are only guaranteed to match right after a
-  `/login`. If you've been switching back and forth manually, do a
-  `/logout` + `/login` first to resync before saving.
+  currently in the credential store AND whatever identity is currently
+  cached in `~/.claude.json`. Those are only guaranteed to match right
+  after a `/login`. If you've been switching back and forth manually, do
+  a `/logout` + `/login` first to resync before saving.
 
 ## Uninstall
 
@@ -254,5 +267,5 @@ state.
 rm -rf ~/.config/claudeswitch      # (optional) also remove saved profiles + mappings
 ```
 
-This doesn't touch your Keychain entry or `~/.claude.json`, so your current
-Claude Code login remains intact.
+This doesn't touch your stored credentials or `~/.claude.json`, so your
+current Claude Code login remains intact.

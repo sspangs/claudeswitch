@@ -32,9 +32,12 @@ Flags:
   -h, --help           show this message
 
 What it does:
-  1. Verifies macOS and installs jq if missing (via Homebrew).
+  1. Verifies jq is installed (offers to 'brew install' on macOS,
+     else prints a platform-specific hint).
   2. Symlinks 'claudeswitch' and 'clsw' into ~/.local/bin.
   3. Optionally installs the 'claude' shell wrapper for fish/bash/zsh.
+
+Supported platforms: macOS, Linux, Windows (Git Bash or WSL).
 EOF
 }
 
@@ -67,8 +70,22 @@ confirm() {
   [[ "$yn" =~ ^[Yy]$ ]]
 }
 
-require_macos() {
-  [ "$(uname -s)" = "Darwin" ] || die "claudeswitch only supports macOS (uses the Keychain)"
+detect_platform() {
+  case "$(uname -s)" in
+    Darwin)                 echo macos   ;;
+    Linux)                  echo linux   ;;
+    MINGW*|MSYS*|CYGWIN*)   echo windows ;;
+    *)                      echo unknown ;;
+  esac
+}
+
+PLATFORM="$(detect_platform)"
+
+require_supported_os() {
+  case "$PLATFORM" in
+    macos|linux|windows) ;;
+    *) die "unsupported platform: $(uname -s)" ;;
+  esac
 }
 
 detect_shell() {
@@ -83,20 +100,28 @@ detect_shell() {
   esac
 }
 
+jq_install_hint() {
+  case "$PLATFORM" in
+    macos)    echo "install Homebrew (https://brew.sh), then: brew install jq" ;;
+    linux)    echo "install via your package manager, e.g. 'sudo apt install jq', 'sudo dnf install jq', or 'sudo pacman -S jq'" ;;
+    windows)  echo "install via Scoop ('scoop install jq') or Chocolatey ('choco install jq'); you need a POSIX shell like Git Bash or WSL to run claudeswitch" ;;
+  esac
+}
+
 ensure_jq() {
   if command -v jq >/dev/null 2>&1; then
     ok "jq is installed"
     return
   fi
-  if ! command -v brew >/dev/null 2>&1; then
-    die "jq is required. Install Homebrew (https://brew.sh), then run: brew install jq"
+  # macOS + brew: offer to auto-install. Other platforms: print hint and exit.
+  if [ "$PLATFORM" = "macos" ] && command -v brew >/dev/null 2>&1; then
+    if confirm "jq is not installed. Install it via Homebrew now?" y; then
+      brew install jq
+      ok "jq installed"
+      return
+    fi
   fi
-  if confirm "jq is not installed. Install it via Homebrew now?" y; then
-    brew install jq
-    ok "jq installed"
-  else
-    die "jq is required; aborting"
-  fi
+  die "jq is required. $(jq_install_hint)"
 }
 
 install_symlinks() {
@@ -218,7 +243,7 @@ path_notice() {
 }
 
 do_install() {
-  require_macos
+  require_supported_os
   ensure_jq
   install_symlinks
   maybe_install_wrapper

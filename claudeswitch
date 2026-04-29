@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# claudeswitch - manage Claude Code CLI logins on macOS, with per-repo
-# auto-switching. Invoke as `claudeswitch` or the short alias `clsw`.
+# claudeswitch - manage Claude Code CLI logins, with per-repo auto-switching.
+# Invoke as `claudeswitch` or the short alias `clsw`.
 #
 # Profiles:  ~/.config/claudeswitch/profiles/<name>.json   (mode 0600)
 # Repo map:  ~/.config/claudeswitch/repos.json             (mode 0600)
 # Default:   ~/.config/claudeswitch/default                (mode 0600)
-# Keychain:  service "Claude Code-credentials"
+#
+# Credential store (where Claude Code keeps the OAuth blob):
+#   macOS:          Keychain, service "Claude Code-credentials"
+#   Linux/Windows:  ~/.claude/.credentials.json (plaintext)
 
 set -euo pipefail
 
@@ -16,7 +19,20 @@ PROFILE_DIR="$PROFILE_ROOT/profiles"
 MAP_FILE="$PROFILE_ROOT/repos.json"
 DEFAULT_FILE="$PROFILE_ROOT/default"
 CLAUDE_JSON="$HOME/.claude.json"
+CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+CREDS_FILE="$CLAUDE_CONFIG_DIR/.credentials.json"
 SENTINEL_UNMANAGED="-"
+
+detect_platform() {
+  case "$(uname -s)" in
+    Darwin)                 echo macos   ;;
+    Linux)                  echo linux   ;;
+    MINGW*|MSYS*|CYGWIN*)   echo windows ;;
+    *)                      echo unknown ;;
+  esac
+}
+
+PLATFORM="$(detect_platform)"
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 info() { printf '[%s] %s\n' "$PROG" "$*" >&2; }
@@ -26,28 +42,61 @@ require() {
 }
 
 require jq
-require security
 require shasum
+case "$PLATFORM" in
+  macos)              require security ;;
+  linux|windows)      : ;;
+  *)                  die "unsupported platform: $(uname -s)" ;;
+esac
 
 mkdir -p "$PROFILE_DIR"
 chmod 700 "$PROFILE_ROOT" "$PROFILE_DIR" 2>/dev/null || true
 
-# --- keychain --------------------------------------------------------------
+# --- credential store ------------------------------------------------------
 
-keychain_read() {
-  security find-generic-password -s "$SERVICE" -w 2>/dev/null
+creds_read() {
+  case "$PLATFORM" in
+    macos)
+      security find-generic-password -s "$SERVICE" -w 2>/dev/null
+      ;;
+    linux|windows)
+      [ -f "$CREDS_FILE" ] || return 1
+      cat "$CREDS_FILE"
+      ;;
+  esac
 }
 
-keychain_account() {
-  security find-generic-password -s "$SERVICE" 2>/dev/null \
-    | awk -F'"' '/"acct"<blob>=/{print $4; exit}'
+creds_write() {
+  local blob="$1"
+  case "$PLATFORM" in
+    macos)
+      local acct
+      acct="$(security find-generic-password -s "$SERVICE" 2>/dev/null \
+        | awk -F'"' '/"acct"<blob>=/{print $4; exit}' || true)"
+      acct="${acct:-$USER}"
+      security add-generic-password -s "$SERVICE" -a "$acct" -w "$blob" -U >/dev/null
+      ;;
+    linux|windows)
+      mkdir -p "$CLAUDE_CONFIG_DIR"
+      chmod 700 "$CLAUDE_CONFIG_DIR" 2>/dev/null || true
+      ( umask 077; printf '%s' "$blob" > "$CREDS_FILE" )
+      chmod 600 "$CREDS_FILE" 2>/dev/null || true
+      ;;
+  esac
 }
 
-keychain_write() {
-  local blob="$1" acct
-  acct="$(keychain_account 2>/dev/null || true)"
-  acct="${acct:-$USER}"
-  security add-generic-password -s "$SERVICE" -a "$acct" -w "$blob" -U >/dev/null
+creds_missing_msg() {
+  case "$PLATFORM" in
+    macos)          echo "no active Claude Code login found in Keychain - run 'claude' and sign in first" ;;
+    linux|windows)  echo "no active Claude Code login at $CREDS_FILE - run 'claude' and sign in first" ;;
+  esac
+}
+
+creds_location_label() {
+  case "$PLATFORM" in
+    macos)          echo "macOS Keychain, service \"$SERVICE\"" ;;
+    linux|windows)  echo "$CREDS_FILE" ;;
+  esac
 }
 
 # --- profiles --------------------------------------------------------------
@@ -73,9 +122,9 @@ current_email_from_claude_json() {
 }
 
 # Capture the account-identity subtree of ~/.claude.json. Claude Code caches
-# "who am I" here, so a Keychain swap alone isn't enough - we also have to
-# splice these fields back on `use`. Keep this list minimal; add more only
-# when a stale field causes a visible bug.
+# "who am I" here, so a credential swap alone isn't enough - we also have
+# to splice these fields back on `use`. Keep this list minimal; add more
+# only when a stale field causes a visible bug.
 identity_from_claude_json() {
   [ -f "$CLAUDE_JSON" ] || { printf 'null'; return; }
   jq -c '{
@@ -111,7 +160,7 @@ list_profile_names() {
 
 active_profile_name() {
   local active active_fp name fp
-  active="$(keychain_read 2>/dev/null || true)"
+  active="$(creds_read 2>/dev/null || true)"
   [ -n "$active" ] || return 0
   active_fp="$(printf '%s' "$active" | blob_fingerprint)"
   shopt -s nullglob
@@ -271,10 +320,10 @@ prompt_new_profile_flow() {
 
   CLAUDE_SWITCH_BYPASS=1 command claude || true
 
-  # Save whatever's now in the keychain as this profile.
+  # Save whatever's now in the credential store as this profile.
   local blob
-  blob="$(keychain_read)" || { echo "no login was completed; aborting." >&2; return 1; }
-  [ -n "$blob" ] || { echo "Keychain entry is empty; aborting." >&2; return 1; }
+  blob="$(creds_read)" || { echo "no login was completed; aborting." >&2; return 1; }
+  [ -n "$blob" ] || { echo "credential store is empty; aborting." >&2; return 1; }
 
   # Guard: don't collide with an existing profile's fingerprint.
   local new_fp cur_name
@@ -369,8 +418,8 @@ cmd_save() {
   local name="$1" path blob email tier envelope saved_at
   path="$(profile_path "$name")"
 
-  blob="$(keychain_read)" || die "no active Claude Code login found in Keychain - run 'claude' and sign in first"
-  [ -n "$blob" ] || die "Keychain entry is empty"
+  blob="$(creds_read)" || die "$(creds_missing_msg)"
+  [ -n "$blob" ] || die "credential store is empty"
 
   email="$(current_email_from_claude_json)"
   tier="$(printf '%s' "$blob" | jq -r '.claudeAiOauth.subscriptionType // "?"')"
@@ -407,7 +456,7 @@ cmd_use() {
   blob="$(profile_blob "$path")"
   [ -n "$blob" ] && [ "$blob" != "null" ] || die "profile '$1' is missing a blob (corrupt file?)"
 
-  keychain_write "$blob"
+  creds_write "$blob"
 
   identity="$(jq -c '.identity // null' "$path")"
   if [ "$identity" = "null" ]; then
@@ -425,7 +474,7 @@ cmd_current() {
   name="$(active_profile_name)"
   if [ -z "$name" ]; then
     local blob
-    blob="$(keychain_read 2>/dev/null || true)"
+    blob="$(creds_read 2>/dev/null || true)"
     if [ -z "$blob" ]; then
       echo "no active login"
     else
@@ -587,8 +636,8 @@ cmd_add() {
   CLAUDE_SWITCH_BYPASS=1 command claude || true
 
   local blob
-  blob="$(keychain_read)" || die "no login was completed"
-  [ -n "$blob" ] || die "Keychain entry is empty"
+  blob="$(creds_read)" || die "no login was completed"
+  [ -n "$blob" ] || die "credential store is empty"
   cmd_save "$name"
 }
 
@@ -686,7 +735,7 @@ state:
   profiles: $PROFILE_DIR
   repo map: $MAP_FILE
   default:  $DEFAULT_FILE
-  keychain: service "$SERVICE"
+  creds:    $(creds_location_label)
 
 the wrapper will prompt the first time you run \`claude\` in an
 unmanaged directory. set \$CLAUDE_SWITCH_BYPASS=1 to skip the wrapper.
