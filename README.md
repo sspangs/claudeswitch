@@ -15,7 +15,7 @@ Primary command: `claudeswitch`. Short alias: `clsw`.
 clsw save personal
 clsw save work
 clsw use work        # now `claude` runs as your work account
-clsw current         # -> work
+clsw current         # -> work  you@company.example  [max]
 ```
 
 ## Requirements
@@ -108,7 +108,7 @@ clsw list
 
 # 4. Switch manually whenever you want.
 clsw use personal
-clsw current        # -> personal
+clsw current        # -> personal  you@personal.example  [max]
 ```
 
 ### Auto-switch per directory (the shell wrapper)

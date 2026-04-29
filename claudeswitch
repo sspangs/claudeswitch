@@ -519,19 +519,29 @@ cmd_use() {
 }
 
 cmd_current() {
-  local name
+  local name path email tier blob live_email
   name="$(active_profile_name)"
   if [ -z "$name" ]; then
-    local blob
     blob="$(creds_read 2>/dev/null || true)"
     if [ -z "$blob" ]; then
       echo "no active login"
+      return
+    fi
+    live_email="$(current_email_from_claude_json)"
+    if [ -n "$live_email" ]; then
+      printf '(unsaved - %s) - run %s save <name> to track it\n' "$live_email" "$PROG"
     else
-      echo "(unsaved - run '$PROG save <name>' to track it)"
+      printf '(unsaved) - run %s save <name> to track it\n' "$PROG"
     fi
     return
   fi
-  echo "$name"
+  path="$(profile_path "$name")"
+  email="$(profile_email "$path")"
+  tier="$(profile_tier "$path")"
+  printf '%s' "$name"
+  [ -n "$email" ] && printf '  %s' "$email"
+  [ -n "$tier" ] && [ "$tier" != "?" ] && printf '  [%s]' "$tier"
+  printf '\n'
 }
 
 cmd_list() {
