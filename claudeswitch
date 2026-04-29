@@ -617,6 +617,14 @@ cmd_link() {
   [ -f "$(profile_path "$profile")" ] || die "no such profile: $profile"
   set_mapping "$target" "$profile"
   printf 'linked %s -> %s\n' "$target" "$profile"
+
+  # If we just linked the cwd, activate the profile now too. Otherwise the
+  # link sits unused in repos.json until the shell wrapper next calls
+  # `clsw ensure` before `claude` - which is a common gotcha when the
+  # wrapper isn't installed.
+  if [ "$target" = "$(abs_dir "$PWD")" ]; then
+    ensure_active "$profile"
+  fi
 }
 
 cmd_unlink() {

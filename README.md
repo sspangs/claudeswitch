@@ -170,14 +170,19 @@ Resolution order when you run `claude`:
 ### Managing mappings
 
 ```sh
-clsw link work               # link the cwd to 'work'
-clsw link work ~/src/acme    # link a specific directory
+clsw link work               # link the cwd to 'work' AND switch to it now
+clsw link work ~/src/acme    # link a different directory (no switch)
 clsw unlink                  # remove the mapping for cwd
 clsw which                   # show what would be used here, and why
 # -> work (inherited from /Users/you/src)
 # -> personal (default)
 # -> (unmanaged - mapped at /Users/you/throwaway)
 ```
+
+Linking the cwd also activates the profile right then, so the change
+takes effect even if you don't have the shell wrapper installed.
+Linking a different directory just records the mapping; the wrapper
+applies it the next time you run `claude` there.
 
 Explicit links beat the default, so linking a repo pins it even if the
 default already routes there today. Useful when a repo must always use a
