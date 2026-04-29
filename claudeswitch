@@ -769,6 +769,13 @@ EOF
   esac
 }
 
+cmd_paths() {
+  printf 'profiles: %s\n' "$PROFILE_DIR"
+  printf 'repo map: %s\n' "$MAP_FILE"
+  printf 'default:  %s\n' "$DEFAULT_FILE"
+  printf 'creds:    %s\n' "$(creds_location_label)"
+}
+
 cmd_help() {
   cat <<EOF
 $PROG - manage Claude Code CLI logins (alias: clsw)
@@ -778,7 +785,8 @@ profile management:
   $PROG add  <name>            log in as a new account, then save it as <name>
   $PROG use  <name>            make <name> the active login
   $PROG list                   list saved profiles (marks active with *)
-  $PROG current                print the name of the active profile
+  $PROG current                print the active profile
+  $PROG paths                  show where claudeswitch keeps state
   $PROG rm <name>              delete a saved profile
 
 per-directory auto-switching:
@@ -790,12 +798,6 @@ per-directory auto-switching:
   $PROG ensure                 internal: used by the shell wrapper
   $PROG init-shell <fish|bash|zsh>
                                print a 'claude' shell wrapper to eval
-
-state:
-  profiles: $PROFILE_DIR
-  repo map: $MAP_FILE
-  default:  $DEFAULT_FILE
-  creds:    $(creds_location_label)
 
 the wrapper will prompt the first time you run \`claude\` in an
 unmanaged directory. set \$CLAUDE_SWITCH_BYPASS=1 to skip the wrapper.
@@ -813,6 +815,7 @@ case "$cmd" in
   use|switch)         cmd_use        "$@" ;;
   list|ls)            cmd_list       "$@" ;;
   current|who)        cmd_current    "$@" ;;
+  paths)              cmd_paths      "$@" ;;
   rm|remove|delete)   cmd_rm         "$@" ;;
   link)               cmd_link       "$@" ;;
   unlink)             cmd_unlink     "$@" ;;

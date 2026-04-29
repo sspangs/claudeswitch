@@ -69,7 +69,8 @@ clsw save <name>            snapshot the current login as <name>
 clsw add  <name>            log in as a new account, then save it as <name>
 clsw use  <name>            make <name> the active login
 clsw list                   list saved profiles (marks active with *)
-clsw current                print the name of the active profile
+clsw current                print the active profile
+clsw paths                  show where claudeswitch keeps state
 clsw rm <name>              delete a saved profile
 ```
 
