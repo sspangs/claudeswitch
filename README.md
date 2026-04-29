@@ -213,11 +213,15 @@ What each command does:
   caches "who am I" in `~/.claude.json` and trusts that cache over the
   credential store for things like the displayed email and subscription
   state.
-- `use <name>` writes the saved blob into the credential store and splices
-  the saved identity subtree back into `~/.claude.json` so the UI matches
-  the token.
+- `use <name>` first snapshots the outgoing profile (Claude Code may have
+  just rotated its refresh token in the background, and the rotated token
+  is the only one the auth server will still accept), then writes the
+  saved blob into the credential store and splices the saved identity
+  subtree back into `~/.claude.json` so the UI matches the token.
 - `current` / `list` identify the active profile by hashing the refresh
-  token and matching against saved profiles.
+  token and matching against saved profiles. If the fingerprint has
+  drifted (refresh tokens rotate on use), they fall back to matching by
+  the email cached in `~/.claude.json`.
 - `ensure` (called by the shell wrapper) walks up from the cwd looking for
   a mapping in `~/.config/claudeswitch/repos.json`, falls back to the
   default, then prompts if neither exists.
@@ -240,10 +244,11 @@ state.
 - **Profile files contain live OAuth tokens.** They're written with mode
   `0600`, but treat `~/.config/claudeswitch/` the same way you'd treat
   `~/.ssh/` - don't commit it, don't sync it to places you don't trust.
-- **Refresh tokens rotate.** After enough time, a saved profile's
-  fingerprint may stop matching the live credential store, so `list` won't
-  show a `*`. If that happens, just `clsw save <name>` again while that
-  account is active - it's cheap and re-snaps the fingerprint.
+- **Refresh tokens rotate.** Handled automatically: `use` snapshots the
+  outgoing profile before switching so a rotated token isn't lost, and
+  `list` / `current` fall back to matching by email when the fingerprint
+  has drifted. You only need to re-`save` if a profile's identity (email
+  or subscription) actually changed.
 - **macOS may prompt for Keychain access** the first time the script reads
   or writes the entry from a new terminal. Click "Always Allow" to skip
   future prompts.

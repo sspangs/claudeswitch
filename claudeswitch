@@ -150,6 +150,21 @@ splice_identity_into_claude_json() {
   chmod 600 "$CLAUDE_JSON"
 }
 
+build_envelope() {
+  local blob="$1" email tier saved_at identity
+  email="$(current_email_from_claude_json)"
+  tier="$(printf '%s' "$blob" | jq -r '.claudeAiOauth.subscriptionType // "?"')"
+  saved_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  identity="$(identity_from_claude_json)"
+  jq -n \
+    --arg blob "$blob" \
+    --arg email "$email" \
+    --arg tier "$tier" \
+    --arg saved_at "$saved_at" \
+    --argjson identity "$identity" \
+    '{blob: $blob, email: $email, tier: $tier, saved_at: $saved_at, identity: $identity}'
+}
+
 list_profile_names() {
   shopt -s nullglob
   local f
@@ -159,7 +174,7 @@ list_profile_names() {
 }
 
 active_profile_name() {
-  local active active_fp name fp
+  local active active_fp name fp email match=""
   active="$(creds_read 2>/dev/null || true)"
   [ -n "$active" ] || return 0
   active_fp="$(printf '%s' "$active" | blob_fingerprint)"
@@ -172,6 +187,45 @@ active_profile_name() {
       return
     fi
   done
+
+  # Fingerprint missed - the OAuth refresh token rotates every time Claude
+  # Code refreshes the session, so the saved snapshot drifts out of sync
+  # within a few days. Fall back to matching by the email Claude Code
+  # caches in ~/.claude.json so we can still identify the live profile.
+  email="$(current_email_from_claude_json)"
+  [ -n "$email" ] || return 0
+  for f in "$PROFILE_DIR"/*.json; do
+    if [ "$(profile_email "$f")" = "$email" ]; then
+      [ -n "$match" ] && return 0
+      match="$(basename "$f" .json)"
+    fi
+  done
+  [ -n "$match" ] && echo "$match"
+}
+
+# Capture the live blob (which Claude Code may have just refreshed) back
+# into whichever profile it belongs to. Refresh tokens rotate on use, so
+# without this the saved profile silently turns into a stale snapshot
+# that the auth server will reject the next time we restore it.
+snapshot_active_profile() {
+  local name path live saved envelope tmp
+  name="$(active_profile_name)"
+  [ -n "$name" ] || return 0
+  path="$(profile_path "$name")"
+  [ -f "$path" ] || return 0
+
+  live="$(creds_read 2>/dev/null || true)"
+  [ -n "$live" ] || return 0
+
+  saved="$(profile_blob "$path")"
+  [ "$saved" = "$live" ] && return 0
+
+  envelope="$(build_envelope "$live")"
+  tmp="$(mktemp)"
+  printf '%s\n' "$envelope" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$path"
+  info "snapshotted refreshed credentials into profile: $name"
 }
 
 # --- repo map & default ----------------------------------------------------
@@ -318,6 +372,7 @@ prompt_new_profile_flow() {
   printf 'press Enter to continue... ' >&2
   IFS= read -r _ </dev/tty || true
 
+  snapshot_active_profile
   CLAUDE_SWITCH_BYPASS=1 command claude || true
 
   # Save whatever's now in the credential store as this profile.
@@ -415,17 +470,12 @@ prompt_and_resolve() {
 cmd_save() {
   [ $# -eq 1 ] || die "usage: $PROG save <name>"
   valid_name "$1"
-  local name="$1" path blob email tier envelope saved_at
+  local name="$1" path blob email envelope
   path="$(profile_path "$name")"
 
   blob="$(creds_read)" || die "$(creds_missing_msg)"
   [ -n "$blob" ] || die "credential store is empty"
-
   email="$(current_email_from_claude_json)"
-  tier="$(printf '%s' "$blob" | jq -r '.claudeAiOauth.subscriptionType // "?"')"
-  saved_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  local identity
-  identity="$(identity_from_claude_json)"
 
   if [ -e "$path" ]; then
     printf "profile '%s' already exists - overwrite? [y/N] " "$name"
@@ -433,14 +483,7 @@ cmd_save() {
     [[ "$yn" =~ ^[Yy]$ ]] || { echo "aborted"; exit 1; }
   fi
 
-  envelope="$(jq -n \
-    --arg blob "$blob" \
-    --arg email "$email" \
-    --arg tier "$tier" \
-    --arg saved_at "$saved_at" \
-    --argjson identity "$identity" \
-    '{blob: $blob, email: $email, tier: $tier, saved_at: $saved_at, identity: $identity}')"
-
+  envelope="$(build_envelope "$blob")"
   ( umask 077; printf '%s\n' "$envelope" > "$path" )
   printf 'saved profile: %s' "$name"
   [ -n "$email" ] && printf ' (%s)' "$email"
@@ -450,6 +493,12 @@ cmd_save() {
 cmd_use() {
   [ $# -eq 1 ] || die "usage: $PROG use <name>"
   valid_name "$1"
+
+  # Preserve any token Claude refreshed in the outgoing profile - otherwise
+  # we'd overwrite the live (rotated) refresh token with the stale one we
+  # snapshotted last time, and the auth server would reject it on next use.
+  snapshot_active_profile
+
   local path blob identity
   path="$(profile_path "$1")"
   [ -f "$path" ] || die "no such profile: $1"
@@ -633,6 +682,7 @@ cmd_add() {
   printf 'press Enter to continue... '
   IFS= read -r _ </dev/tty || true
 
+  snapshot_active_profile
   CLAUDE_SWITCH_BYPASS=1 command claude || true
 
   local blob
