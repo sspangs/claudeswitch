@@ -34,8 +34,8 @@ Windows. See [How it works](#how-it-works) for details.
 ./install.sh
 ```
 
-That checks for `jq` (offers to `brew install` it on macOS, prints a
-package-manager hint elsewhere), symlinks `claudeswitch` and `clsw` into
+That checks for `jq` (offers to install it via Homebrew on macOS or
+`apt-get` on Linux/WSL), symlinks `claudeswitch` and `clsw` into
 `~/.local/bin`, and offers to install the `claude` shell wrapper for your
 shell. Re-running it is safe - the shell-rc block is replaced in place,
 not duplicated.
