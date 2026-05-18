@@ -52,9 +52,19 @@ sha1_digest() {
   fi
 }
 
+detect_keychain_service() {
+  local service
+  service="$(security dump-keychain 2>/dev/null \
+    | awk -F'"' '/"svce"<blob>="Claude Code-/{print $4; exit}' || true)"
+  printf '%s\n' "${service:-$SERVICE}"
+}
+
 require jq
 case "$PLATFORM" in
-  macos)              require security ;;
+  macos)
+    require security
+    SERVICE="$(detect_keychain_service)"
+    ;;
   linux|windows)      : ;;
   *)                  die "unsupported platform: $(uname -s)" ;;
 esac
@@ -64,9 +74,29 @@ chmod 700 "$PROFILE_ROOT" "$PROFILE_DIR" 2>/dev/null || true
 
 # --- credential store ------------------------------------------------------
 
-creds_read_keychain() {
+creds_read_keychain_raw() {
   [ "$PLATFORM" = "macos" ] || return 1
   security find-generic-password -s "$SERVICE" -w 2>/dev/null
+}
+
+creds_read_keychain() {
+  local raw
+  raw="$(creds_read_keychain_raw)" || return 1
+  if printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
+    printf '%s' "$raw"
+  else
+    jq -cn --arg primaryApiKey "$raw" '{primaryApiKey: $primaryApiKey}'
+  fi
+}
+
+creds_keychain_store() {
+  local raw
+  raw="$(creds_read_keychain_raw)" || return 1
+  if printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
+    printf 'keychain\n'
+  else
+    printf 'keychain-api-key\n'
+  fi
 }
 
 creds_read_file() {
@@ -95,7 +125,7 @@ creds_read_with_store() {
         return 0
       fi
       if creds_read_keychain >/dev/null 2>&1; then
-        printf 'keychain\t%s\n' "$(creds_read_keychain)"
+        printf '%s\t%s\n' "$(creds_keychain_store)" "$(creds_read_keychain)"
         return 0
       fi
       return 1
@@ -197,6 +227,11 @@ creds_write() {
           creds_write_file "$blob"
           state_remove_oauth_identity
           creds_clear_keychain
+          ;;
+        keychain-api-key)
+          creds_write_keychain "$(printf '%s' "$blob" | jq -r '.primaryApiKey')"
+          creds_clear_file
+          state_remove_api_key
           ;;
         keychain|"")
           creds_write_keychain "$blob"
@@ -345,6 +380,7 @@ active_profile_name() {
     fi
   done
   [ -n "$match" ] && echo "$match"
+  return 0
 }
 
 # Capture the live blob (which Claude Code may have just refreshed) back
@@ -492,12 +528,27 @@ prompt_pick_profile() {
   done
 }
 
+resolve_claude_bin() {
+  if [ -n "${CLAUDESWITCH_CLAUDE_BIN:-}" ]; then
+    printf '%s\n' "$CLAUDESWITCH_CLAUDE_BIN"
+    return 0
+  fi
+
+  local mise_npm_claude="$HOME/.local/share/mise/installs/npm-anthropic-ai-claude-code/latest/bin/claude"
+  if [ -x "$mise_npm_claude" ]; then
+    printf '%s\n' "$mise_npm_claude"
+    return 0
+  fi
+
+  command -v claude
+}
+
 run_claude_bypassed() {
   local claude_bin
-  claude_bin="$(command -v claude)" || die "missing dependency: claude"
+  claude_bin="$(resolve_claude_bin)" || die "missing dependency: claude"
   info "launching Claude Code: $claude_bin"
   if [ -r /dev/tty ] && [ -w /dev/tty ]; then
-    env CLAUDE_SWITCH_BYPASS=1 "$claude_bin" </dev/tty >/dev/tty
+    env CLAUDE_SWITCH_BYPASS=1 "$claude_bin" </dev/tty >/dev/tty 2>&1
   else
     env CLAUDE_SWITCH_BYPASS=1 "$claude_bin"
   fi
@@ -544,13 +595,13 @@ prompt_new_profile_flow() {
     if [ "$(profile_blob "$f" | blob_fingerprint)" = "$new_fp" ]; then
       cur_name="$(basename "$f" .json)"
       echo "that looks like the same account as profile '$cur_name' - not saving a duplicate." >&2
-      echo "$cur_name"
+      PROMPT_NEW_PROFILE_NAME="$cur_name"
       return 0
     fi
   done
 
   cmd_save "$name" >/dev/null
-  echo "$name"
+  PROMPT_NEW_PROFILE_NAME="$name"
 }
 
 prompt_and_resolve() {
@@ -599,7 +650,8 @@ prompt_and_resolve() {
       return 0
     elif [ "$choice" -eq "$add_idx" ]; then
       local new_name
-      new_name="$(prompt_new_profile_flow)" || return 1
+      prompt_new_profile_flow || return 1
+      new_name="$PROMPT_NEW_PROFILE_NAME"
       set_mapping "$target" "$new_name"
       info "linked $target -> $new_name"
       ensure_active "$new_name"
