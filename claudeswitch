@@ -6,9 +6,10 @@
 # Repo map:  ~/.config/claudeswitch/repos.json             (mode 0600)
 # Default:   ~/.config/claudeswitch/default                (mode 0600)
 #
-# Credential store (where Claude Code keeps the OAuth blob):
+# Credential store (where Claude Code keeps auth material):
 #   macOS:          Keychain, service "Claude Code-credentials"
-#   Linux/Windows:  ~/.claude/.credentials.json (plaintext)
+#                   or config state for /login managed API keys
+#   Linux/Windows:  ~/.claude/.credentials.json or config state
 
 set -euo pipefail
 
@@ -18,8 +19,8 @@ PROFILE_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/claudeswitch"
 PROFILE_DIR="$PROFILE_ROOT/profiles"
 MAP_FILE="$PROFILE_ROOT/repos.json"
 DEFAULT_FILE="$PROFILE_ROOT/default"
-CLAUDE_JSON="$HOME/.claude.json"
 CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+CLAUDE_JSON="${CLAUDE_JSON:-$CLAUDE_CONFIG_DIR/.claude.json}"
 CREDS_FILE="$CLAUDE_CONFIG_DIR/.credentials.json"
 SENTINEL_UNMANAGED="-"
 
@@ -41,8 +42,17 @@ require() {
   command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
 }
 
+sha1_digest() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum
+  elif command -v sha1sum >/dev/null 2>&1; then
+    sha1sum
+  else
+    die "missing dependency: shasum or sha1sum"
+  fi
+}
+
 require jq
-require shasum
 case "$PLATFORM" in
   macos)              require security ;;
   linux|windows)      : ;;
@@ -54,48 +64,176 @@ chmod 700 "$PROFILE_ROOT" "$PROFILE_DIR" 2>/dev/null || true
 
 # --- credential store ------------------------------------------------------
 
-creds_read() {
+creds_read_keychain() {
+  [ "$PLATFORM" = "macos" ] || return 1
+  security find-generic-password -s "$SERVICE" -w 2>/dev/null
+}
+
+creds_read_file() {
+  [ -f "$CREDS_FILE" ] || return 1
+  cat "$CREDS_FILE"
+}
+
+creds_read_state_api_key() {
+  [ -f "$CLAUDE_JSON" ] || return 1
+  jq -cer 'select(.primaryApiKey? and .primaryApiKey != "")
+    | {primaryApiKey: .primaryApiKey}' "$CLAUDE_JSON"
+}
+
+creds_read_with_store() {
   case "$PLATFORM" in
     macos)
-      security find-generic-password -s "$SERVICE" -w 2>/dev/null
+      # Claude Code can have OAuth credentials and a /login managed API key at
+      # the same time. That creates an auth conflict, so prefer the managed key
+      # when present; `use` clears inactive auth to keep Claude Code sane.
+      if creds_read_state_api_key >/dev/null 2>&1; then
+        printf 'state-api-key\t%s\n' "$(creds_read_state_api_key)"
+        return 0
+      fi
+      if creds_read_file >/dev/null 2>&1; then
+        printf 'file\t%s\n' "$(creds_read_file)"
+        return 0
+      fi
+      if creds_read_keychain >/dev/null 2>&1; then
+        printf 'keychain\t%s\n' "$(creds_read_keychain)"
+        return 0
+      fi
+      return 1
       ;;
     linux|windows)
-      [ -f "$CREDS_FILE" ] || return 1
-      cat "$CREDS_FILE"
+      if creds_read_state_api_key >/dev/null 2>&1; then
+        printf 'state-api-key\t%s\n' "$(creds_read_state_api_key)"
+        return 0
+      fi
+      if creds_read_file >/dev/null 2>&1; then
+        printf 'file\t%s\n' "$(creds_read_file)"
+        return 0
+      fi
+      return 1
       ;;
   esac
 }
 
-creds_write() {
+creds_read() {
+  local line
+  line="$(creds_read_with_store)" || return 1
+  printf '%s' "${line#*$'\t'}"
+}
+
+creds_store() {
+  local line
+  line="$(creds_read_with_store)" || return 1
+  printf '%s' "${line%%$'\t'*}"
+}
+
+creds_write_keychain() {
+  local blob="$1" acct
+  acct="$(security find-generic-password -s "$SERVICE" 2>/dev/null \
+    | awk -F'"' '/"acct"<blob>=/{print $4; exit}' || true)"
+  acct="${acct:-$USER}"
+  security add-generic-password -s "$SERVICE" -a "$acct" -w "$blob" -U >/dev/null
+}
+
+creds_write_file() {
   local blob="$1"
+  mkdir -p "$CLAUDE_CONFIG_DIR"
+  chmod 700 "$CLAUDE_CONFIG_DIR" 2>/dev/null || true
+  ( umask 077; printf '%s' "$blob" > "$CREDS_FILE" )
+  chmod 600 "$CREDS_FILE" 2>/dev/null || true
+}
+
+creds_clear_keychain() {
+  [ "$PLATFORM" = "macos" ] || return 0
+  security delete-generic-password -s "$SERVICE" >/dev/null 2>&1 || true
+}
+
+creds_clear_file() {
+  rm -f -- "$CREDS_FILE"
+}
+
+state_remove_api_key() {
+  [ -f "$CLAUDE_JSON" ] || return 0
+  local tmp
+  tmp="$(mktemp)"
+  jq 'del(.primaryApiKey)' "$CLAUDE_JSON" > "$tmp"
+  mv "$tmp" "$CLAUDE_JSON"
+  chmod 600 "$CLAUDE_JSON"
+}
+
+state_remove_oauth_identity() {
+  [ -f "$CLAUDE_JSON" ] || return 0
+  local tmp
+  tmp="$(mktemp)"
+  jq 'del(.oauthAccount, .userID)
+    | .hasAvailableSubscription = false' "$CLAUDE_JSON" > "$tmp"
+  mv "$tmp" "$CLAUDE_JSON"
+  chmod 600 "$CLAUDE_JSON"
+}
+
+creds_write_state_api_key() {
+  local blob="$1" tmp
+  mkdir -p "$CLAUDE_CONFIG_DIR"
+  chmod 700 "$CLAUDE_CONFIG_DIR" 2>/dev/null || true
+  [ -f "$CLAUDE_JSON" ] || ( umask 077; printf '{}\n' > "$CLAUDE_JSON" )
+  tmp="$(mktemp)"
+  jq --argjson auth "$blob" '.primaryApiKey = $auth.primaryApiKey' \
+    "$CLAUDE_JSON" > "$tmp"
+  mv "$tmp" "$CLAUDE_JSON"
+  chmod 600 "$CLAUDE_JSON"
+}
+
+creds_write() {
+  local blob="$1" store="${2:-}"
   case "$PLATFORM" in
     macos)
-      local acct
-      acct="$(security find-generic-password -s "$SERVICE" 2>/dev/null \
-        | awk -F'"' '/"acct"<blob>=/{print $4; exit}' || true)"
-      acct="${acct:-$USER}"
-      security add-generic-password -s "$SERVICE" -a "$acct" -w "$blob" -U >/dev/null
+      case "$store" in
+        state-api-key)
+          creds_write_state_api_key "$blob"
+          state_remove_oauth_identity
+          creds_clear_keychain
+          creds_clear_file
+          ;;
+        file)
+          creds_write_file "$blob"
+          state_remove_oauth_identity
+          creds_clear_keychain
+          ;;
+        keychain|"")
+          creds_write_keychain "$blob"
+          creds_clear_file
+          state_remove_api_key
+          ;;
+        *) die "unknown credential store: $store" ;;
+      esac
       ;;
     linux|windows)
-      mkdir -p "$CLAUDE_CONFIG_DIR"
-      chmod 700 "$CLAUDE_CONFIG_DIR" 2>/dev/null || true
-      ( umask 077; printf '%s' "$blob" > "$CREDS_FILE" )
-      chmod 600 "$CREDS_FILE" 2>/dev/null || true
+      case "$store" in
+        state-api-key)
+          creds_write_state_api_key "$blob"
+          state_remove_oauth_identity
+          creds_clear_file
+          ;;
+        file|"")
+          creds_write_file "$blob"
+          state_remove_api_key
+          ;;
+        *) die "unknown credential store: $store" ;;
+      esac
       ;;
   esac
 }
 
 creds_missing_msg() {
   case "$PLATFORM" in
-    macos)          echo "no active Claude Code login found in Keychain - run 'claude' and sign in first" ;;
-    linux|windows)  echo "no active Claude Code login at $CREDS_FILE - run 'claude' and sign in first" ;;
+    macos)          echo "no active Claude Code login found in Keychain, $CREDS_FILE, or $CLAUDE_JSON - run 'claude' and sign in first" ;;
+    linux|windows)  echo "no active Claude Code login in $CREDS_FILE or $CLAUDE_JSON - run 'claude' and sign in first" ;;
   esac
 }
 
 creds_location_label() {
   case "$PLATFORM" in
-    macos)          echo "macOS Keychain, service \"$SERVICE\"" ;;
-    linux|windows)  echo "$CREDS_FILE" ;;
+    macos)          echo "macOS Keychain, service \"$SERVICE\"; $CREDS_FILE; or $CLAUDE_JSON for /login managed API keys" ;;
+    linux|windows)  echo "$CREDS_FILE or $CLAUDE_JSON for /login managed API keys" ;;
   esac
 }
 
@@ -110,10 +248,14 @@ profile_path()  { printf '%s/%s.json' "$PROFILE_DIR" "$1"; }
 profile_blob()  { jq -r '.blob'         "$1"; }
 profile_email() { jq -r '.email // ""'  "$1"; }
 profile_tier()  { jq -r '.tier  // "?"' "$1"; }
+profile_store() { jq -r '.store // ""'  "$1"; }
 
 blob_fingerprint() {
-  jq -r '.claudeAiOauth.refreshToken // .claudeAiOauth.accessToken // empty' \
-    | shasum | cut -c1-12
+  jq -r '.claudeAiOauth.refreshToken
+    // .claudeAiOauth.accessToken
+    // .primaryApiKey
+    // empty' \
+    | sha1_digest | cut -c1-12
 }
 
 current_email_from_claude_json() {
@@ -151,18 +293,20 @@ splice_identity_into_claude_json() {
 }
 
 build_envelope() {
-  local blob="$1" email tier saved_at identity
+  local blob="$1" store="${2:-}" email tier saved_at identity
   email="$(current_email_from_claude_json)"
-  tier="$(printf '%s' "$blob" | jq -r '.claudeAiOauth.subscriptionType // "?"')"
+  tier="$(printf '%s' "$blob" | jq -r 'if .primaryApiKey then "api" else (.claudeAiOauth.subscriptionType // "?") end')"
   saved_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   identity="$(identity_from_claude_json)"
+  [ -n "$store" ] || store="$(creds_store 2>/dev/null || true)"
   jq -n \
     --arg blob "$blob" \
     --arg email "$email" \
     --arg tier "$tier" \
     --arg saved_at "$saved_at" \
+    --arg store "$store" \
     --argjson identity "$identity" \
-    '{blob: $blob, email: $email, tier: $tier, saved_at: $saved_at, identity: $identity}'
+    '{blob: $blob, email: $email, tier: $tier, saved_at: $saved_at, store: $store, identity: $identity}'
 }
 
 list_profile_names() {
@@ -208,7 +352,7 @@ active_profile_name() {
 # without this the saved profile silently turns into a stale snapshot
 # that the auth server will reject the next time we restore it.
 snapshot_active_profile() {
-  local name path live saved envelope tmp
+  local name path live saved envelope tmp store
   name="$(active_profile_name)"
   [ -n "$name" ] || return 0
   path="$(profile_path "$name")"
@@ -216,11 +360,12 @@ snapshot_active_profile() {
 
   live="$(creds_read 2>/dev/null || true)"
   [ -n "$live" ] || return 0
+  store="$(creds_store 2>/dev/null || true)"
 
   saved="$(profile_blob "$path")"
-  [ "$saved" = "$live" ] && return 0
+  [ "$saved" = "$live" ] && [ "$(profile_store "$path")" = "$store" ] && return 0
 
-  envelope="$(build_envelope "$live")"
+  envelope="$(build_envelope "$live" "$store")"
   tmp="$(mktemp)"
   printf '%s\n' "$envelope" > "$tmp"
   chmod 600 "$tmp"
@@ -347,6 +492,17 @@ prompt_pick_profile() {
   done
 }
 
+run_claude_bypassed() {
+  local claude_bin
+  claude_bin="$(command -v claude)" || die "missing dependency: claude"
+  info "launching Claude Code: $claude_bin"
+  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    env CLAUDE_SWITCH_BYPASS=1 "$claude_bin" </dev/tty >/dev/tty
+  else
+    env CLAUDE_SWITCH_BYPASS=1 "$claude_bin"
+  fi
+}
+
 prompt_new_profile_flow() {
   # Prompt for a name, run login under bypass, save as that name.
   # Echoes the new profile name on success; returns 1 on cancel.
@@ -372,8 +528,8 @@ prompt_new_profile_flow() {
   printf 'press Enter to continue... ' >&2
   IFS= read -r _ </dev/tty || true
 
-  snapshot_active_profile
-  CLAUDE_SWITCH_BYPASS=1 command claude || true
+  snapshot_active_profile || true
+  run_claude_bypassed || true
 
   # Save whatever's now in the credential store as this profile.
   local blob
@@ -470,11 +626,12 @@ prompt_and_resolve() {
 cmd_save() {
   [ $# -eq 1 ] || die "usage: $PROG save <name>"
   valid_name "$1"
-  local name="$1" path blob email envelope
+  local name="$1" path blob email envelope store
   path="$(profile_path "$name")"
 
   blob="$(creds_read)" || die "$(creds_missing_msg)"
   [ -n "$blob" ] || die "credential store is empty"
+  store="$(creds_store 2>/dev/null || true)"
   email="$(current_email_from_claude_json)"
 
   if [ -e "$path" ]; then
@@ -483,7 +640,7 @@ cmd_save() {
     [[ "$yn" =~ ^[Yy]$ ]] || { echo "aborted"; exit 1; }
   fi
 
-  envelope="$(build_envelope "$blob")"
+  envelope="$(build_envelope "$blob" "$store")"
   ( umask 077; printf '%s\n' "$envelope" > "$path" )
   printf 'saved profile: %s' "$name"
   [ -n "$email" ] && printf ' (%s)' "$email"
@@ -499,20 +656,23 @@ cmd_use() {
   # snapshotted last time, and the auth server would reject it on next use.
   snapshot_active_profile
 
-  local path blob identity
+  local path blob identity store
   path="$(profile_path "$1")"
   [ -f "$path" ] || die "no such profile: $1"
   blob="$(profile_blob "$path")"
   [ -n "$blob" ] && [ "$blob" != "null" ] || die "profile '$1' is missing a blob (corrupt file?)"
+  store="$(profile_store "$path")"
 
-  creds_write "$blob"
+  creds_write "$blob" "$store"
 
-  identity="$(jq -c '.identity // null' "$path")"
-  if [ "$identity" = "null" ]; then
-    info "profile '$1' has no identity snapshot - ~/.claude.json won't be updated."
-    info "re-run '$PROG save $1' while signed in as that account to capture identity."
-  else
-    splice_identity_into_claude_json "$identity"
+  if [ "$store" != "state-api-key" ]; then
+    identity="$(jq -c '.identity // null' "$path")"
+    if [ "$identity" = "null" ]; then
+      info "profile '$1' has no identity snapshot - $CLAUDE_JSON won't be updated."
+      info "re-run '$PROG save $1' while signed in as that account to capture identity."
+    else
+      splice_identity_into_claude_json "$identity"
+    fi
   fi
 
   printf 'switched to profile: %s\n' "$1"
@@ -700,8 +860,8 @@ cmd_add() {
   printf 'press Enter to continue... '
   IFS= read -r _ </dev/tty || true
 
-  snapshot_active_profile
-  CLAUDE_SWITCH_BYPASS=1 command claude || true
+  snapshot_active_profile || true
+  run_claude_bypassed || true
 
   local blob
   blob="$(creds_read)" || die "no login was completed"

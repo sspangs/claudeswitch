@@ -113,10 +113,16 @@ ensure_jq() {
     ok "jq is installed"
     return
   fi
-  # macOS + brew: offer to auto-install. Other platforms: print hint and exit.
   if [ "$PLATFORM" = "macos" ] && command -v brew >/dev/null 2>&1; then
     if confirm "jq is not installed. Install it via Homebrew now?" y; then
       brew install jq
+      ok "jq installed"
+      return
+    fi
+  elif [ "$PLATFORM" = "linux" ] && command -v apt-get >/dev/null 2>&1; then
+    if confirm "jq is not installed. Install it via apt-get now?" y; then
+      sudo apt-get update
+      sudo apt-get install -y jq
       ok "jq installed"
       return
     fi
