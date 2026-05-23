@@ -1,0 +1,43 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Project {
+  id          String      @id @default(cuid())
+  title       String
+  synopsis    String      @default("")
+  styleNote   String      @default("")
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  chapters    Chapter[]
+  loreEntries LoreEntry[]
+}
+
+model Chapter {
+  id        String   @id @default(cuid())
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  title     String
+  order     Int      @default(0)
+  content   String   @default("")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model LoreEntry {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  kind        String   @default("character")
+  name        String
+  description String   @default("")
+  imagePath   String?
+  imagePrompt String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
