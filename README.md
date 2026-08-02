@@ -234,6 +234,11 @@ What each command does:
 - `ensure` (called by the shell wrapper) walks up from the cwd looking for
   a mapping in `~/.config/claudeswitch/repos.json`, falls back to the
   default, then prompts if neither exists.
+- anything that mutates state (`use`, `save`, `rm`, `ensure`'s
+  auto-switch, mapping edits) first takes a lock at
+  `~/.config/claudeswitch/.lock`, so shells running in parallel can't
+  interleave a snapshot with a switch. Locks left behind by a crashed run
+  are stolen automatically once the owning process is gone.
 
 State lives in `~/.config/claudeswitch/`:
 

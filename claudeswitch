@@ -21,6 +21,7 @@ PROFILE_DIR="$PROFILE_ROOT/profiles"
 MAP_FILE="$PROFILE_ROOT/repos.json"
 DEFAULT_FILE="$PROFILE_ROOT/default"
 ACTIVE_FILE="$PROFILE_ROOT/active"
+LOCK_DIR="$PROFILE_ROOT/.lock"
 CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 CLAUDE_JSON="${CLAUDE_JSON:-$CLAUDE_CONFIG_DIR/.claude.json}"
 CREDS_FILE="$CLAUDE_CONFIG_DIR/.credentials.json"
@@ -73,6 +74,42 @@ esac
 
 mkdir -p "$PROFILE_DIR"
 chmod 700 "$PROFILE_ROOT" "$PROFILE_DIR" 2>/dev/null || true
+
+# --- locking ---------------------------------------------------------------
+
+# Serialize everything that reads-then-writes the credential store, profile
+# files, or repo map: concurrent `ensure` runs from parallel shells can
+# otherwise interleave a snapshot with a switch and corrupt a profile.
+# mkdir is the atomic primitive (macOS has no flock).
+LOCK_HELD=""
+
+lock_acquire() {
+  [ -n "$LOCK_HELD" ] && return 0
+  local tries=0 max_tries pid
+  max_tries=$(( ${CLAUDESWITCH_LOCK_TIMEOUT:-10} * 10 ))
+  until mkdir "$LOCK_DIR" 2>/dev/null; do
+    pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      # Holder died without cleaning up; steal. (Tiny race with another
+      # stealer here - acceptable for an interactive tool.)
+      rm -rf -- "$LOCK_DIR"
+      continue
+    fi
+    tries=$((tries+1))
+    [ "$tries" -ge "$max_tries" ] \
+      && die "timed out waiting for lock held by pid ${pid:-unknown} (if stale: rm -rf '$LOCK_DIR')"
+    sleep 0.1
+  done
+  printf '%s' "$$" > "$LOCK_DIR/pid"
+  LOCK_HELD=1
+  trap lock_release EXIT
+}
+
+lock_release() {
+  [ -n "$LOCK_HELD" ] || return 0
+  rm -rf -- "$LOCK_DIR"
+  LOCK_HELD=""
+}
 
 # --- credential store ------------------------------------------------------
 
@@ -424,6 +461,7 @@ active_profile_name() {
 # that the auth server will reject the next time we restore it.
 snapshot_active_profile() {
   local name path live saved envelope tmp store
+  lock_acquire
   name="$(active_profile_name)"
   [ -n "$name" ] || return 0
   path="$(profile_path "$name")"
@@ -468,6 +506,7 @@ find_mapping() {
 
 set_mapping() {
   local dir="$1" val="$2" tmp
+  lock_acquire
   if [ ! -f "$MAP_FILE" ]; then
     ( umask 077; printf '{}\n' > "$MAP_FILE" )
   fi
@@ -479,6 +518,7 @@ set_mapping() {
 
 unset_mapping() {
   local dir="$1" tmp
+  lock_acquire
   [ -f "$MAP_FILE" ] || return 0
   tmp="$(mktemp)"
   jq --arg k "$dir" 'del(.[$k])' "$MAP_FILE" > "$tmp"
@@ -515,6 +555,7 @@ ensure_active() {
     info "warning: profile '$want' is missing; run '$PROG save $want' (or unlink)"
     return 0
   }
+  lock_acquire
   cur="$(active_profile_name)"
   [ "$cur" = "$want" ] && return 0
   cmd_use "$want" >/dev/null
@@ -615,6 +656,7 @@ prompt_new_profile_flow() {
   IFS= read -r _ </dev/tty || true
 
   snapshot_active_profile || true
+  lock_release  # don't hold the lock across an interactive login
   run_claude_bypassed || true
 
   # Save whatever's now in the credential store as this profile.
@@ -717,16 +759,19 @@ cmd_save() {
   local name="$1" path blob email envelope store
   path="$(profile_path "$name")"
 
-  blob="$(creds_read)" || die "$(creds_missing_msg)"
-  [ -n "$blob" ] || die "credential store is empty"
-  store="$(creds_store 2>/dev/null || true)"
-  email="$(current_email_from_claude_json)"
-
+  # Prompt before taking the lock so a lingering prompt can't block
+  # other invocations.
   if [ -e "$path" ]; then
     printf "profile '%s' already exists - overwrite? [y/N] " "$name"
     IFS= read -r yn
     [[ "$yn" =~ ^[Yy]$ ]] || { echo "aborted"; exit 1; }
   fi
+
+  lock_acquire
+  blob="$(creds_read)" || die "$(creds_missing_msg)"
+  [ -n "$blob" ] || die "credential store is empty"
+  store="$(creds_store 2>/dev/null || true)"
+  email="$(current_email_from_claude_json)"
 
   envelope="$(build_envelope "$blob" "$store")"
   ( umask 077; printf '%s\n' "$envelope" > "$path" )
@@ -739,6 +784,7 @@ cmd_save() {
 cmd_use() {
   [ $# -eq 1 ] || die "usage: $PROG use <name>"
   valid_name "$1"
+  lock_acquire
 
   # Preserve any token Claude refreshed in the outgoing profile - otherwise
   # we'd overwrite the live (rotated) refresh token with the stale one we
@@ -836,6 +882,7 @@ cmd_rm() {
   local path
   path="$(profile_path "$1")"
   [ -f "$path" ] || die "no such profile: $1"
+  lock_acquire
   rm -f -- "$path"
   # Clean up references.
   if [ -f "$ACTIVE_FILE" ] && [ "$(tr -d '\n' < "$ACTIVE_FILE")" = "$1" ]; then
@@ -957,6 +1004,7 @@ cmd_add() {
   IFS= read -r _ </dev/tty || true
 
   snapshot_active_profile || true
+  lock_release  # don't hold the lock across an interactive login
   run_claude_bypassed || true
 
   local blob
