@@ -5,6 +5,7 @@
 # Profiles:  ~/.config/claudeswitch/profiles/<name>.json   (mode 0600)
 # Repo map:  ~/.config/claudeswitch/repos.json             (mode 0600)
 # Default:   ~/.config/claudeswitch/default                (mode 0600)
+# Active:    ~/.config/claudeswitch/active                 (mode 0600)
 #
 # Credential store (where Claude Code keeps auth material):
 #   macOS:          Keychain, service "Claude Code-credentials"
@@ -19,6 +20,7 @@ PROFILE_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/claudeswitch"
 PROFILE_DIR="$PROFILE_ROOT/profiles"
 MAP_FILE="$PROFILE_ROOT/repos.json"
 DEFAULT_FILE="$PROFILE_ROOT/default"
+ACTIVE_FILE="$PROFILE_ROOT/active"
 CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 CLAUDE_JSON="${CLAUDE_JSON:-$CLAUDE_CONFIG_DIR/.claude.json}"
 CREDS_FILE="$CLAUDE_CONFIG_DIR/.credentials.json"
@@ -352,8 +354,20 @@ list_profile_names() {
   done
 }
 
+# Last profile we activated (`use`) or captured (`save`).
+get_active_record() {
+  [ -f "$ACTIVE_FILE" ] || return 0
+  local name
+  name="$(tr -d '\n' < "$ACTIVE_FILE")"
+  [ -n "$name" ] && [ -f "$(profile_path "$name")" ] && printf '%s\n' "$name"
+  return 0
+}
+
+set_active_record()   { ( umask 077; printf '%s\n' "$1" > "$ACTIVE_FILE" ); }
+clear_active_record() { rm -f "$ACTIVE_FILE"; }
+
 active_profile_name() {
-  local active active_fp name fp email match=""
+  local active active_fp name fp email recorded match="" ambiguous=""
   active="$(creds_read 2>/dev/null || true)"
   [ -n "$active" ] || return 0
   active_fp="$(printf '%s' "$active" | blob_fingerprint)"
@@ -367,19 +381,40 @@ active_profile_name() {
     fi
   done
 
-  # Fingerprint missed - the OAuth refresh token rotates every time Claude
-  # Code refreshes the session, so the saved snapshot drifts out of sync
-  # within a few days. Fall back to matching by the email Claude Code
-  # caches in ~/.claude.json so we can still identify the live profile.
+  # Fingerprint missed (refresh tokens rotate). Fall back to the cached
+  # email and the active record; a wrong guess corrupts a profile on the
+  # next snapshot, so on conflicting evidence return nothing.
   email="$(current_email_from_claude_json)"
-  [ -n "$email" ] || return 0
-  for f in "$PROFILE_DIR"/*.json; do
-    if [ "$(profile_email "$f")" = "$email" ]; then
-      [ -n "$match" ] && return 0
-      match="$(basename "$f" .json)"
+  recorded="$(get_active_record)"
+
+  if [ -n "$email" ]; then
+    for f in "$PROFILE_DIR"/*.json; do
+      if [ "$(profile_email "$f")" = "$email" ]; then
+        if [ -n "$match" ]; then ambiguous=1; break; fi
+        match="$(basename "$f" .json)"
+      fi
+    done
+    if [ -n "$ambiguous" ]; then
+      # Several profiles share this email; let the active record pick.
+      if [ -n "$recorded" ] \
+        && [ "$(profile_email "$(profile_path "$recorded")")" = "$email" ]; then
+        echo "$recorded"
+      fi
+      return 0
     fi
-  done
-  [ -n "$match" ] && echo "$match"
+    if [ -n "$match" ]; then
+      if [ -n "$recorded" ] && [ "$recorded" != "$match" ]; then
+        return 0
+      fi
+      echo "$match"
+      return 0
+    fi
+    # Cached email matches no saved profile: an untracked login, so the
+    # active record is stale too.
+    return 0
+  fi
+
+  [ -n "$recorded" ] && echo "$recorded"
   return 0
 }
 
@@ -595,6 +630,7 @@ prompt_new_profile_flow() {
     if [ "$(profile_blob "$f" | blob_fingerprint)" = "$new_fp" ]; then
       cur_name="$(basename "$f" .json)"
       echo "that looks like the same account as profile '$cur_name' - not saving a duplicate." >&2
+      set_active_record "$cur_name"
       PROMPT_NEW_PROFILE_NAME="$cur_name"
       return 0
     fi
@@ -694,6 +730,7 @@ cmd_save() {
 
   envelope="$(build_envelope "$blob" "$store")"
   ( umask 077; printf '%s\n' "$envelope" > "$path" )
+  set_active_record "$name"
   printf 'saved profile: %s' "$name"
   [ -n "$email" ] && printf ' (%s)' "$email"
   printf '\n'
@@ -720,13 +757,17 @@ cmd_use() {
   if [ "$store" != "state-api-key" ]; then
     identity="$(jq -c '.identity // null' "$path")"
     if [ "$identity" = "null" ]; then
-      info "profile '$1' has no identity snapshot - $CLAUDE_JSON won't be updated."
+      # No snapshot to splice; clear the outgoing identity so a stale email
+      # can't misattribute the live credentials later.
+      state_remove_oauth_identity
+      info "profile '$1' has no identity snapshot - cleared stale identity from $CLAUDE_JSON."
       info "re-run '$PROG save $1' while signed in as that account to capture identity."
     else
       splice_identity_into_claude_json "$identity"
     fi
   fi
 
+  set_active_record "$1"
   printf 'switched to profile: %s\n' "$1"
 }
 
@@ -797,6 +838,9 @@ cmd_rm() {
   [ -f "$path" ] || die "no such profile: $1"
   rm -f -- "$path"
   # Clean up references.
+  if [ -f "$ACTIVE_FILE" ] && [ "$(tr -d '\n' < "$ACTIVE_FILE")" = "$1" ]; then
+    clear_active_record
+  fi
   if [ "$(get_default)" = "$1" ]; then
     clear_default
     info "cleared default (was $1)"
@@ -993,6 +1037,7 @@ cmd_paths() {
   printf 'profiles: %s\n' "$PROFILE_DIR"
   printf 'repo map: %s\n' "$MAP_FILE"
   printf 'default:  %s\n' "$DEFAULT_FILE"
+  printf 'active:   %s\n' "$ACTIVE_FILE"
   printf 'creds:    %s\n' "$(creds_location_label)"
 }
 

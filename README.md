@@ -226,8 +226,11 @@ What each command does:
   subtree back into `~/.claude.json` so the UI matches the token.
 - `current` / `list` identify the active profile by hashing the refresh
   token and matching against saved profiles. If the fingerprint has
-  drifted (refresh tokens rotate on use), they fall back to matching by
-  the email cached in `~/.claude.json`.
+  drifted (refresh tokens rotate on use), they fall back to the email
+  cached in `~/.claude.json` and the last profile claudeswitch activated
+  (recorded in `~/.config/claudeswitch/active`). If those two disagree,
+  the profile is treated as unknown rather than guessed at, since a wrong
+  guess would snapshot the live credentials into the wrong profile.
 - `ensure` (called by the shell wrapper) walks up from the cwd looking for
   a mapping in `~/.config/claudeswitch/repos.json`, falls back to the
   default, then prompts if neither exists.
@@ -238,6 +241,7 @@ State lives in `~/.config/claudeswitch/`:
 profiles/<name>.json   # per-profile snapshot (mode 0600)
 repos.json             # { "/abs/repo/path": "profile_name_or_-" }
 default                # single line: default profile name
+active                 # single line: last profile activated or saved
 ```
 
 Nothing else is touched - no symlink swapping, no daemons, no background
