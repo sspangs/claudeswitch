@@ -361,11 +361,14 @@ current_email_from_claude_json() {
 # only when a stale field causes a visible bug.
 identity_from_claude_json() {
   [ -f "$CLAUDE_JSON" ] || { printf 'null'; return; }
-  jq -c '{
-    userID: .userID,
-    oauthAccount: .oauthAccount,
-    hasAvailableSubscription: .hasAvailableSubscription
-  }' "$CLAUDE_JSON" 2>/dev/null || printf 'null'
+  # An object of all-null fields is "no identity", not an identity: saving
+  # it would silence the no-snapshot warning while splicing back nothing.
+  jq -c 'if .oauthAccount == null and .userID == null then null
+    else {
+      userID: .userID,
+      oauthAccount: .oauthAccount,
+      hasAvailableSubscription: .hasAvailableSubscription
+    } end' "$CLAUDE_JSON" 2>/dev/null || printf 'null'
 }
 
 splice_identity_into_claude_json() {
@@ -780,15 +783,21 @@ prompt_and_resolve() {
 cmd_save() {
   [ $# -eq 1 ] || die "usage: $PROG save <name>"
   valid_name "$1"
-  local name="$1" path blob email envelope store
+  local name="$1" path blob email envelope store live_fp saved_fp
   path="$(profile_path "$name")"
 
   # Prompt before taking the lock so a lingering prompt can't block
-  # other invocations.
+  # other invocations. Skip the prompt when the live credentials carry the
+  # same fingerprint as the existing profile: that's a refresh of the same
+  # account (what snapshot_active_profile does silently), not a clobber.
   if [ -e "$path" ]; then
-    printf "profile '%s' already exists - overwrite? [y/N] " "$name"
-    IFS= read -r yn
-    [[ "$yn" =~ ^[Yy]$ ]] || { echo "aborted"; exit 1; }
+    live_fp="$(creds_read 2>/dev/null | blob_fingerprint)" || live_fp=""
+    saved_fp="$(profile_blob "$path" | blob_fingerprint)" || saved_fp=""
+    if [ -z "$live_fp" ] || [ -z "$saved_fp" ] || [ "$live_fp" != "$saved_fp" ]; then
+      printf "profile '%s' already exists - overwrite? [y/n] " "$name"
+      IFS= read -r yn
+      [[ "$yn" =~ ^[Yy]$ ]] || { echo "aborted"; exit 1; }
+    fi
   fi
 
   lock_acquire
@@ -825,13 +834,16 @@ cmd_use() {
   creds_write "$blob" "$store"
 
   if [ "$store" != "state-api-key" ]; then
-    identity="$(jq -c '.identity // null' "$path")"
+    # Treat an all-null identity object (captured by older versions while
+    # ~/.claude.json had no identity) the same as no snapshot at all.
+    identity="$(jq -c 'if .identity.oauthAccount == null and .identity.userID == null
+      then null else .identity end' "$path")"
     if [ "$identity" = "null" ]; then
       # No snapshot to splice; clear the outgoing identity so a stale email
       # can't misattribute the live credentials later.
       state_remove_oauth_identity
       info "profile '$1' has no identity snapshot - cleared stale identity from $CLAUDE_JSON."
-      info "re-run '$PROG save $1' while signed in as that account to capture identity."
+      info "run 'claude' once as this account, quit, then '$PROG save $1' to capture it."
     else
       splice_identity_into_claude_json "$identity"
     fi

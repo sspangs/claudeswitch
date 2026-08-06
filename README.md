@@ -218,7 +218,11 @@ What each command does:
   `hasAvailableSubscription`). The snapshot is needed because Claude Code
   caches "who am I" in `~/.claude.json` and trusts that cache over the
   credential store for things like the displayed email and subscription
-  state.
+  state. If `~/.claude.json` has no identity at save time, the profile
+  records no snapshot (and `use` will say so) rather than an empty one.
+  Overwriting an existing profile prompts for confirmation, except when
+  the live credentials are the same account as the saved ones - that's
+  just a refresh, so it proceeds silently.
 - `use <name>` first snapshots the outgoing profile (Claude Code may have
   just rotated its refresh token in the background, and the rotated token
   is the only one the auth server will still accept), then writes the
