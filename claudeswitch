@@ -381,6 +381,13 @@ blob_fingerprint() {
   printf '%s' "$key" | sha1_digest | cut -c1-12
 }
 
+blob_has_credential() {
+  # /logout leaves the store holding only mcpOAuth entries - a blob with no
+  # Claude login in it. Such a blob must never be saved, snapshotted, or
+  # restored: writing one over a profile destroys that profile's login.
+  [ -n "$(printf '%s' "$1" | blob_fingerprint)" ]
+}
+
 current_email_from_claude_json() {
   [ -f "$CLAUDE_JSON" ] || return 0
   jq -r '.oauthAccount.emailAddress // ""' "$CLAUDE_JSON" 2>/dev/null || true
@@ -459,6 +466,10 @@ active_profile_name() {
   active="$(creds_read 2>/dev/null || true)"
   [ -n "$active" ] || return 0
   active_fp="$(printf '%s' "$active" | blob_fingerprint)"
+  # A credential-less blob (logged-out store) belongs to no profile; letting
+  # the email/active-record fallbacks claim it would corrupt that profile on
+  # the next snapshot.
+  [ -n "$active_fp" ] || return 0
   shopt -s nullglob
   for f in "$PROFILE_DIR"/*.json; do
     name="$(basename "$f" .json)"
@@ -527,6 +538,7 @@ snapshot_active_profile() {
 
   live="$(creds_read 2>/dev/null || true)"
   [ -n "$live" ] || return 0
+  blob_has_credential "$live" || return 0
   store="$(creds_store 2>/dev/null || true)"
 
   saved="$(profile_blob "$path")"
@@ -721,6 +733,8 @@ prompt_new_profile_flow() {
   local blob
   blob="$(creds_read)" || { echo "no login was completed; aborting." >&2; return 1; }
   [ -n "$blob" ] || { echo "credential store is empty; aborting." >&2; return 1; }
+  blob_has_credential "$blob" \
+    || { echo "no login was completed (store has no Claude credential); aborting." >&2; return 1; }
 
   # Guard: don't collide with an existing profile's fingerprint.
   local new_fp cur_name
@@ -834,6 +848,8 @@ cmd_save() {
   lock_acquire
   blob="$(creds_read)" || die "$(creds_missing_msg)"
   [ -n "$blob" ] || die "credential store is empty"
+  blob_has_credential "$blob" \
+    || die "credential store has no Claude login (logged out?) - run 'claude', sign in, then save"
   store="$(creds_store 2>/dev/null || true)"
   email="$(current_email_from_claude_json)"
 
@@ -860,6 +876,8 @@ cmd_use() {
   [ -f "$path" ] || die "no such profile: $1"
   blob="$(profile_blob "$path")"
   [ -n "$blob" ] && [ "$blob" != "null" ] || die "profile '$1' is missing a blob (corrupt file?)"
+  blob_has_credential "$blob" \
+    || die "profile '$1' has no Claude login in it (captured while logged out?) - log in as that account and run '$PROG save $1' to repair it"
   store="$(profile_store "$path")"
 
   creds_write "$blob" "$store"
@@ -1077,6 +1095,7 @@ cmd_add() {
   local blob
   blob="$(creds_read)" || die "no login was completed"
   [ -n "$blob" ] || die "credential store is empty"
+  blob_has_credential "$blob" || die "no login was completed (store has no Claude credential)"
   cmd_save "$name"
 }
 
