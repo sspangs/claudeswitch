@@ -9,6 +9,8 @@
 #
 # Credential store (where Claude Code keeps auth material):
 #   macOS:          Keychain, service "Claude Code-credentials"
+#                   (suffixed with a config-dir hash when CLAUDE_CONFIG_DIR
+#                   or CLAUDE_SECURESTORAGE_CONFIG_DIR is set),
 #                   or config state for /login managed API keys
 #   Linux/Windows:  ~/.claude/.credentials.json or config state
 
@@ -29,6 +31,9 @@ if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
 else
   _default_claude_json="$HOME/.claude.json"
 fi
+# The keychain service name depends on whether these were set in the
+# environment, so remember that before CLAUDE_CONFIG_DIR gets defaulted.
+_ENV_CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-}"
 CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 CLAUDE_JSON="${CLAUDE_JSON:-$_default_claude_json}"
 CREDS_FILE="$CLAUDE_CONFIG_DIR/.credentials.json"
@@ -62,17 +67,43 @@ sha1_digest() {
   fi
 }
 
+sha256_digest() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum
+  else
+    die "missing dependency: shasum or sha256sum"
+  fi
+}
+
 mktemp_for() {
   # Temp file beside its destination: rename stays on one filesystem and
   # secret-bearing content never lands in a shared temp dir.
   mktemp "$(dirname "$1")/.tmp.XXXXXX"
 }
 
+# Claude Code derives its keychain service name from the config dir env:
+# the plain name when neither CLAUDE_SECURESTORAGE_CONFIG_DIR nor
+# CLAUDE_CONFIG_DIR is set, otherwise "-<first 8 hex of sha256(dir)>" is
+# appended (an empty CLAUDE_SECURESTORAGE_CONFIG_DIR forces the plain name).
+# Mirror that derivation exactly. Never guess by scanning the keychain:
+# sandboxed/child sessions leave suffixed entries behind, the scan order is
+# unstable, and picking the wrong entry makes every read and write land on
+# credentials Claude Code never uses.
 detect_keychain_service() {
-  local service
-  service="$(security dump-keychain 2>/dev/null \
-    | awk -F'"' '/"svce"<blob>="Claude Code-/{print $4; exit}' || true)"
-  printf '%s\n' "${service:-$SERVICE}"
+  local dir=""
+  if [ -n "${CLAUDE_SECURESTORAGE_CONFIG_DIR+set}" ]; then
+    dir="$CLAUDE_SECURESTORAGE_CONFIG_DIR"
+  elif [ -n "$_ENV_CLAUDE_CONFIG_DIR" ]; then
+    dir="$_ENV_CLAUDE_CONFIG_DIR"
+  fi
+  if [ -z "$dir" ]; then
+    printf '%s\n' "$SERVICE"
+  else
+    printf '%s-%s\n' "$SERVICE" \
+      "$(printf '%s' "$dir" | sha256_digest | cut -c1-8)"
+  fi
 }
 
 require jq
