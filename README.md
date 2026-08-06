@@ -5,11 +5,10 @@ Claude Max account and a work one - without having to `/logout` and
 re-authenticate every time. Works on macOS, Linux, and Windows (via Git
 Bash or WSL).
 
-Save each login once, then swap between them in a single command. Optionally
-set up a shell wrapper so each repo auto-picks the right account the first
-time you run `claude` there.
-
-Primary command: `claudeswitch`. Short alias: `clsw`.
+Save each login once, then swap between them in a single command
+(`claudeswitch`, or its short alias `clsw`). Optionally set up a shell
+wrapper so each repo auto-picks the right account the first time you run
+`claude` there.
 
 ```sh
 clsw save personal
@@ -18,27 +17,18 @@ clsw use work        # now `claude` runs as your work account
 clsw current         # -> work  you@company.example  [max]
 ```
 
-## Requirements
-
-- A POSIX shell: macOS, Linux, or Windows via Git Bash / WSL
-- `bash` 3.2+
-- [`jq`](https://jqlang.github.io/jq/)
-
-Credentials live wherever Claude Code keeps them on your platform: the
-macOS Keychain on macOS, or `~/.claude/.credentials.json` on Linux and
-Windows. See [How it works](#how-it-works) for details.
-
 ## Install
+
+Requires `bash` 3.2+ and [`jq`](https://jqlang.github.io/jq/).
 
 ```sh
 ./install.sh
 ```
 
-That checks for `jq` (offers to install it via Homebrew on macOS or
-`apt-get` on Linux/WSL), symlinks `claudeswitch` and `clsw` into
-`~/.local/bin`, and offers to install the `claude` shell wrapper for your
-shell. Re-running it is safe - the shell-rc block is replaced in place,
-not duplicated.
+That checks for `jq` (offering to install it via Homebrew or `apt-get`),
+symlinks `claudeswitch` and `clsw` into `~/.local/bin`, and offers to
+install the `claude` shell wrapper for your shell. Re-running it is safe -
+the shell-rc block is replaced in place, not duplicated.
 
 Flags:
 
@@ -87,7 +77,7 @@ clsw init-shell <fish|bash|zsh>
                               print a 'claude' shell wrapper to eval
 ```
 
-### A full walkthrough
+### First-time setup
 
 ```sh
 # 1. Sign in as yourself in Claude Code, then snapshot it.
@@ -106,11 +96,9 @@ clsw list
 #     NAME        EMAIL                      TIER      FLAGS
 #   * work        you@company.example        max
 #     personal    you@personal.example       max
-
-# 4. Switch manually whenever you want.
-clsw use personal
-clsw current        # -> personal  you@personal.example  [max]
 ```
+
+From here, switch with `clsw use <name>` as in the quick start above.
 
 ### Auto-switch per directory (the shell wrapper)
 
@@ -182,11 +170,9 @@ clsw which                   # show what would be used here, and why
 Linking the cwd also activates the profile right then, so the change
 takes effect even if you don't have the shell wrapper installed.
 Linking a different directory just records the mapping; the wrapper
-applies it the next time you run `claude` there.
-
-Explicit links beat the default, so linking a repo pins it even if the
-default already routes there today. Useful when a repo must always use a
-specific account regardless of how you change the fallback later.
+applies it the next time you run `claude` there. Links beat the default
+(see the resolution order above), so linking a repo pins it no matter
+how you change the fallback later.
 
 ### Bypassing the wrapper
 
@@ -219,10 +205,9 @@ What each command does:
   caches "who am I" in `~/.claude.json` and trusts that cache over the
   credential store for things like the displayed email and subscription
   state. If `~/.claude.json` has no identity at save time, the profile
-  records no snapshot (and `use` will say so) rather than an empty one.
-  Overwriting an existing profile prompts for confirmation, except when
-  the live credentials are the same account as the saved ones - that's
-  just a refresh, so it proceeds silently.
+  records no snapshot (and `use` will say so). Re-saving over an existing
+  profile prompts for confirmation unless the live credentials are the
+  same account - that's just a refresh, so it proceeds silently.
 - `use <name>` first snapshots the outgoing profile (Claude Code may have
   just rotated its refresh token in the background, and the rotated token
   is the only one the auth server will still accept), then writes the
@@ -282,14 +267,11 @@ state.
   config dir so cloning a shared repo on a new machine won't silently pull
   in someone else's work/personal labels. The tradeoff: you re-link on a
   fresh machine.
-- **First `save` requires you to be signed in.** If the credential store
-  is empty, `save` fails with a clear message - sign in with `claude`
-  first.
-- **Only save right after `/login`.** `save` captures whatever is
-  currently in the credential store AND whatever identity is currently
-  cached in `~/.claude.json`. Those are only guaranteed to match right
-  after a `/login`. If you've been switching back and forth manually, do
-  a `/logout` + `/login` first to resync before saving.
+- **Save when store and cache agree.** `save` captures the credential
+  store AND the identity cached in `~/.claude.json`, and those are only
+  guaranteed to describe the same account right after a `/login` (or a
+  `clsw use`). If you've been logging in and out manually, do a fresh
+  `/logout` + `/login` before saving.
 
 ## Uninstall
 
