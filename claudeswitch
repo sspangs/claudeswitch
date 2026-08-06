@@ -325,11 +325,16 @@ profile_tier()  { jq -r '.tier  // "?"' "$1"; }
 profile_store() { jq -r '.store // ""'  "$1"; }
 
 blob_fingerprint() {
-  jq -r '.claudeAiOauth.refreshToken
+  # Empty output means "no fingerprint". Callers must never treat two
+  # empty fingerprints as equal - hashing the empty extraction would make
+  # a corrupt profile match any tokenless live blob.
+  local key
+  key="$(jq -r '.claudeAiOauth.refreshToken
     // .claudeAiOauth.accessToken
     // .primaryApiKey
-    // empty' \
-    | sha1_digest | cut -c1-12
+    // empty' 2>/dev/null || true)"
+  [ -n "$key" ] || return 0
+  printf '%s' "$key" | sha1_digest | cut -c1-12
 }
 
 current_email_from_claude_json() {
@@ -412,7 +417,7 @@ active_profile_name() {
   for f in "$PROFILE_DIR"/*.json; do
     name="$(basename "$f" .json)"
     fp="$(profile_blob "$f" | blob_fingerprint)"
-    if [ "$fp" = "$active_fp" ]; then
+    if [ -n "$fp" ] && [ "$fp" = "$active_fp" ]; then
       echo "$name"
       return
     fi
@@ -669,7 +674,7 @@ prompt_new_profile_flow() {
   new_fp="$(printf '%s' "$blob" | blob_fingerprint)"
   shopt -s nullglob
   for f in "$PROFILE_DIR"/*.json; do
-    if [ "$(profile_blob "$f" | blob_fingerprint)" = "$new_fp" ]; then
+    if [ -n "$new_fp" ] && [ "$(profile_blob "$f" | blob_fingerprint)" = "$new_fp" ]; then
       cur_name="$(basename "$f" .json)"
       echo "that looks like the same account as profile '$cur_name' - not saving a duplicate." >&2
       set_active_record "$cur_name"
