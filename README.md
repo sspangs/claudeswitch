@@ -231,6 +231,8 @@ What each command does:
   (recorded in `~/.config/claudeswitch/active`). If those two disagree,
   the profile is treated as unknown rather than guessed at, since a wrong
   guess would snapshot the live credentials into the wrong profile.
+  API-key profiles only ever match by exact fingerprint - API keys don't
+  rotate, so a drifted fingerprint rules them out.
 - `ensure` (called by the shell wrapper) walks up from the cwd looking for
   a mapping in `~/.config/claudeswitch/repos.json`, falls back to the
   default, then prompts if neither exists.
@@ -259,6 +261,11 @@ state.
 - **Profile files contain live OAuth tokens.** They're written with mode
   `0600`, but treat `~/.config/claudeswitch/` the same way you'd treat
   `~/.ssh/` - don't commit it, don't sync it to places you don't trust.
+- **Keychain writes briefly expose the blob in `ps` output.** macOS
+  `security add-generic-password` only accepts the secret as a
+  command-line argument, so while a switch writes the Keychain the blob
+  is visible in the process list. Harmless on a single-user machine;
+  worth knowing on shared ones.
 - **Refresh tokens rotate.** Handled automatically: `use` snapshots the
   outgoing profile before switching so a rotated token isn't lost, and
   `list` / `current` fall back to matching by email when the fingerprint

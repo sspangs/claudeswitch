@@ -188,7 +188,9 @@ strip_rc_block() {
       $0 == e { skip=0; next }
       !skip
     ' "$rc" > "$tmp"
-    mv "$tmp" "$rc"
+    # cat, not mv: keeps the rc file's own permissions and ownership
+    cat "$tmp" > "$rc"
+    rm -f "$tmp"
     ok "removed wrapper block from $rc"
   fi
 }

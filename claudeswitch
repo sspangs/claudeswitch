@@ -55,6 +55,12 @@ sha1_digest() {
   fi
 }
 
+mktemp_for() {
+  # Temp file beside its destination: rename stays on one filesystem and
+  # secret-bearing content never lands in a shared temp dir.
+  mktemp "$(dirname "$1")/.tmp.XXXXXX"
+}
+
 detect_keychain_service() {
   local service
   service="$(security dump-keychain 2>/dev/null \
@@ -72,7 +78,7 @@ case "$PLATFORM" in
   *)                  die "unsupported platform: $(uname -s)" ;;
 esac
 
-mkdir -p "$PROFILE_DIR"
+( umask 077; mkdir -p "$PROFILE_DIR" )
 chmod 700 "$PROFILE_ROOT" "$PROFILE_DIR" 2>/dev/null || true
 
 # --- locking ---------------------------------------------------------------
@@ -124,7 +130,7 @@ creds_read_keychain() {
   if printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
     printf '%s' "$raw"
   else
-    jq -cn --arg primaryApiKey "$raw" '{primaryApiKey: $primaryApiKey}'
+    CLSW_KEY="$raw" jq -cn '{primaryApiKey: env.CLSW_KEY}'
   fi
 }
 
@@ -205,7 +211,7 @@ creds_write_keychain() {
 
 creds_write_file() {
   local blob="$1"
-  mkdir -p "$CLAUDE_CONFIG_DIR"
+  ( umask 077; mkdir -p "$CLAUDE_CONFIG_DIR" )
   chmod 700 "$CLAUDE_CONFIG_DIR" 2>/dev/null || true
   ( umask 077; printf '%s' "$blob" > "$CREDS_FILE" )
   chmod 600 "$CREDS_FILE" 2>/dev/null || true
@@ -223,7 +229,7 @@ creds_clear_file() {
 state_remove_api_key() {
   [ -f "$CLAUDE_JSON" ] || return 0
   local tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp_for "$CLAUDE_JSON")"
   jq 'del(.primaryApiKey)' "$CLAUDE_JSON" > "$tmp"
   mv "$tmp" "$CLAUDE_JSON"
   chmod 600 "$CLAUDE_JSON"
@@ -232,7 +238,7 @@ state_remove_api_key() {
 state_remove_oauth_identity() {
   [ -f "$CLAUDE_JSON" ] || return 0
   local tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp_for "$CLAUDE_JSON")"
   jq 'del(.oauthAccount, .userID)
     | .hasAvailableSubscription = false' "$CLAUDE_JSON" > "$tmp"
   mv "$tmp" "$CLAUDE_JSON"
@@ -241,11 +247,11 @@ state_remove_oauth_identity() {
 
 creds_write_state_api_key() {
   local blob="$1" tmp
-  mkdir -p "$CLAUDE_CONFIG_DIR"
+  ( umask 077; mkdir -p "$CLAUDE_CONFIG_DIR" )
   chmod 700 "$CLAUDE_CONFIG_DIR" 2>/dev/null || true
   [ -f "$CLAUDE_JSON" ] || ( umask 077; printf '{}\n' > "$CLAUDE_JSON" )
-  tmp="$(mktemp)"
-  jq --argjson auth "$blob" '.primaryApiKey = $auth.primaryApiKey' \
+  tmp="$(mktemp_for "$CLAUDE_JSON")"
+  CLSW_BLOB="$blob" jq '.primaryApiKey = (env.CLSW_BLOB | fromjson | .primaryApiKey)' \
     "$CLAUDE_JSON" > "$tmp"
   mv "$tmp" "$CLAUDE_JSON"
   chmod 600 "$CLAUDE_JSON"
@@ -359,7 +365,7 @@ splice_identity_into_claude_json() {
   local identity="$1" tmp
   [ -f "$CLAUDE_JSON" ] || return 0
   [ -n "$identity" ] && [ "$identity" != "null" ] || return 0
-  tmp="$(mktemp)"
+  tmp="$(mktemp_for "$CLAUDE_JSON")"
   jq --argjson id "$identity" '
     (if $id.userID then .userID = $id.userID else . end)
     | (if $id.oauthAccount then .oauthAccount = $id.oauthAccount else . end)
@@ -378,14 +384,13 @@ build_envelope() {
   saved_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   identity="$(identity_from_claude_json)"
   [ -n "$store" ] || store="$(creds_store 2>/dev/null || true)"
-  jq -n \
-    --arg blob "$blob" \
+  CLSW_BLOB="$blob" jq -n \
     --arg email "$email" \
     --arg tier "$tier" \
     --arg saved_at "$saved_at" \
     --arg store "$store" \
     --argjson identity "$identity" \
-    '{blob: $blob, email: $email, tier: $tier, saved_at: $saved_at, store: $store, identity: $identity}'
+    '{blob: env.CLSW_BLOB, email: $email, tier: $tier, saved_at: $saved_at, store: $store, identity: $identity}'
 }
 
 list_profile_names() {
@@ -456,7 +461,14 @@ active_profile_name() {
     return 0
   fi
 
-  [ -n "$recorded" ] && echo "$recorded"
+  if [ -n "$recorded" ]; then
+    # API keys never rotate, so a fingerprint miss rules an API-key
+    # profile out; only OAuth tokens drift out of sync.
+    if [ "$(profile_blob "$(profile_path "$recorded")" \
+        | jq -r 'has("primaryApiKey")' 2>/dev/null)" != "true" ]; then
+      echo "$recorded"
+    fi
+  fi
   return 0
 }
 
@@ -480,7 +492,7 @@ snapshot_active_profile() {
   [ "$saved" = "$live" ] && [ "$(profile_store "$path")" = "$store" ] && return 0
 
   envelope="$(build_envelope "$live" "$store")"
-  tmp="$(mktemp)"
+  tmp="$(mktemp_for "$path")"
   printf '%s\n' "$envelope" > "$tmp"
   chmod 600 "$tmp"
   mv "$tmp" "$path"
@@ -515,7 +527,7 @@ set_mapping() {
   if [ ! -f "$MAP_FILE" ]; then
     ( umask 077; printf '{}\n' > "$MAP_FILE" )
   fi
-  tmp="$(mktemp)"
+  tmp="$(mktemp_for "$MAP_FILE")"
   jq --arg k "$dir" --arg v "$val" '.[$k] = $v' "$MAP_FILE" > "$tmp"
   mv "$tmp" "$MAP_FILE"
   chmod 600 "$MAP_FILE"
@@ -525,7 +537,7 @@ unset_mapping() {
   local dir="$1" tmp
   lock_acquire
   [ -f "$MAP_FILE" ] || return 0
-  tmp="$(mktemp)"
+  tmp="$(mktemp_for "$MAP_FILE")"
   jq --arg k "$dir" 'del(.[$k])' "$MAP_FILE" > "$tmp"
   mv "$tmp" "$MAP_FILE"
   chmod 600 "$MAP_FILE"
@@ -899,7 +911,7 @@ cmd_rm() {
   fi
   if [ -f "$MAP_FILE" ]; then
     local tmp
-    tmp="$(mktemp)"
+    tmp="$(mktemp_for "$MAP_FILE")"
     jq --arg v "$1" 'with_entries(select(.value != $v))' "$MAP_FILE" > "$tmp"
     mv "$tmp" "$MAP_FILE"
     chmod 600 "$MAP_FILE"
