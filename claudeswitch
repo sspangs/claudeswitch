@@ -22,8 +22,15 @@ MAP_FILE="$PROFILE_ROOT/repos.json"
 DEFAULT_FILE="$PROFILE_ROOT/default"
 ACTIVE_FILE="$PROFILE_ROOT/active"
 LOCK_DIR="$PROFILE_ROOT/.lock"
+# Claude Code keeps .claude.json at ~/.claude.json unless CLAUDE_CONFIG_DIR
+# is explicitly set, in which case it lives inside that dir.
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  _default_claude_json="$CLAUDE_CONFIG_DIR/.claude.json"
+else
+  _default_claude_json="$HOME/.claude.json"
+fi
 CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-CLAUDE_JSON="${CLAUDE_JSON:-$CLAUDE_CONFIG_DIR/.claude.json}"
+CLAUDE_JSON="${CLAUDE_JSON:-$_default_claude_json}"
 CREDS_FILE="$CLAUDE_CONFIG_DIR/.credentials.json"
 SENTINEL_UNMANAGED="-"
 
