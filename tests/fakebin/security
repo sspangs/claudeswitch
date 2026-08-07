@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Fake macOS `security` for tests: a file-backed generic-password store
+# rooted at $FAKE_KEYCHAIN. Supports exactly the invocations claudeswitch
+# makes; anything else is an error so drift shows up as a test failure.
+set -euo pipefail
+
+[ -n "${FAKE_KEYCHAIN:-}" ] || { echo "fake security: FAKE_KEYCHAIN not set" >&2; exit 64; }
+
+cmd="${1:-}"
+shift || true
+
+service="" acct="" secret="" want_secret=0
+
+case "$cmd" in
+  find-generic-password)
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -s) service="$2"; shift ;;
+        -w) want_secret=1 ;;
+      esac
+      shift
+    done
+    f="$FAKE_KEYCHAIN/$service.secret"
+    [ -f "$f" ] || exit 44
+    if [ "$want_secret" -eq 1 ]; then
+      cat "$f"
+      echo
+    else
+      acct="$(cat "$FAKE_KEYCHAIN/$service.acct" 2>/dev/null || true)"
+      printf 'keychain: "/Users/test/Library/Keychains/login.keychain-db"\n'
+      printf 'attributes:\n'
+      printf '    "acct"<blob>="%s"\n' "$acct"
+    fi
+    ;;
+  add-generic-password)
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -s) service="$2"; shift ;;
+        -a) acct="$2"; shift ;;
+        -w) secret="$2"; shift ;;
+        -U) ;;
+      esac
+      shift
+    done
+    printf '%s' "$secret" > "$FAKE_KEYCHAIN/$service.secret"
+    printf '%s' "$acct"   > "$FAKE_KEYCHAIN/$service.acct"
+    ;;
+  delete-generic-password)
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -s) service="$2"; shift ;;
+      esac
+      shift
+    done
+    [ -f "$FAKE_KEYCHAIN/$service.secret" ] || exit 44
+    rm -f "$FAKE_KEYCHAIN/$service.secret" "$FAKE_KEYCHAIN/$service.acct"
+    ;;
+  *)
+    echo "fake security: unsupported command: $cmd" >&2
+    exit 64
+    ;;
+esac
