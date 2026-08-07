@@ -4,17 +4,12 @@
 
 A tiny CLI for juggling multiple Claude Code logins - e.g. a personal
 Claude Max account and a work one - without having to `/logout` and
-re-authenticate every time. Works on macOS, Linux, and Windows (via Git
+re-authenticate every time. Works on macOS, Linux, and Windows (Git
 Bash or WSL).
 
-Save each login once, then swap between them in a single command
-(`claudeswitch`, or its short alias `clsw`). Optionally set up a shell
-wrapper so each repo auto-picks the right account the first time you run
-`claude` there.
-
 ```sh
-clsw save personal
-clsw save work
+clsw save personal   # snapshot the login you're using right now
+clsw add work        # log in as the second account, saved as 'work'
 clsw use work        # now `claude` runs as your work account
 clsw current         # -> work  you@company.example  [max]
 ```
@@ -27,359 +22,121 @@ Requires `bash` 3.2+ and [`jq`](https://jqlang.github.io/jq/).
 ./install.sh
 ```
 
-That checks for `jq` (offering to install it via Homebrew or `apt-get`),
-symlinks `claudeswitch` and `clsw` into `~/.local/bin`, and offers to
-install the `claude` shell wrapper and tab completions for your shell.
-Re-running it is safe - the shell-rc block is replaced in place, not
-duplicated.
+Symlinks `claudeswitch` and `clsw` into `~/.local/bin` and offers the
+shell wrapper + tab completions. Re-running is safe; `--help` lists
+flags (`-y`, `--uninstall`, `--bin-dir`, `--shell`). Manual install:
+symlink `claudeswitch` (and `clsw`) anywhere on your `PATH`.
 
-Flags:
-
-```
--y, --yes            non-interactive: accept all defaults
---uninstall          remove symlinks and shell wrapper
---bin-dir <dir>      install to <dir> instead of ~/.local/bin
---shell <name>       fish|bash|zsh|none (default: auto-detect from $SHELL)
-```
-
-### Manual install
-
-If you'd rather wire it up yourself:
-
-```sh
-chmod +x claudeswitch
-ln -s "$PWD/claudeswitch" ~/.local/bin/claudeswitch
-ln -s "$PWD/claudeswitch" ~/.local/bin/clsw
-# then set up the shell wrapper (see "Auto-switch per directory" below)
-```
-
-## Usage
-
-### Profile management
+## Commands
 
 ```
-clsw save <name>            snapshot the current login as <name>
-clsw add  [--isolated] <name>
-                            log in as a new account, then save it as <name>
-clsw use  <name>            make <name> the active login
-clsw isolate <name>         give <name> its own Claude config dir (see below)
-clsw env [--shell <s>] <name>
-                            print env exports to run an isolated profile
-clsw list                   list saved profiles (marks active with *)
-clsw current                print the active profile
-clsw show <name>            print a profile's metadata (never the tokens)
-clsw rename <old> <new>     rename a profile (updates links and default)
-clsw paths                  show where claudeswitch keeps state
-clsw rm <name>              delete a saved profile
-```
-
-### Per-directory auto-switching
-
-```
-clsw link [<profile> [dir]]   link current (or given) dir to a profile
-clsw unlink [<dir>]           remove mapping for current (or given) dir
-clsw links                    list all directory mappings
-clsw which [<dir>]            show the effective profile for a dir
-clsw default [<name>]         show / set the fallback profile
-clsw default --clear          clear the fallback profile
-clsw ensure                   internal: used by the shell wrapper
-clsw init-shell <fish|bash|zsh>
-                              print a 'claude' shell wrapper to eval
-```
-
-### Misc
-
-```
-clsw doctor                 check the installation for common problems
-clsw completions <shell>    print tab completions for fish/bash/zsh
-clsw version                print the version
+save <name>               snapshot the current login
+add [--isolated] <name>   log in as a new account and save it
+use <name>                make <name> the active login
+isolate <name>            give <name> its own Claude config dir (see below)
+env [--shell <s>] <name>  print env exports for an isolated profile
+list / current / show     inspect profiles (tokens are never printed)
+rename <old> <new>        rename a profile (updates links and default)
+rm <name>                 delete a profile
+link / unlink / links     map directories to profiles
+which [<dir>]             what would be used in a dir, and why
+default [<name>]          fallback profile for unmanaged dirs
+doctor                    read-only health check with fix hints
+paths / version / init-shell <shell> / completions <shell>
 ```
 
 `list`, `current`, `show`, `links`, and `which` accept `--json` for
-scripting (e.g. showing the active profile in a status line):
+scripting. When something seems off, run `clsw doctor`.
+
+## Auto-switch per directory
+
+Install the wrapper once (`install.sh` offers this):
 
 ```sh
-clsw current --json
-# -> {"status":"active","profile":"work","email":"you@company.example","tier":"max"}
+clsw init-shell fish > ~/.config/fish/functions/claude.fish  # fish
+eval "$(clsw init-shell bash)"       # bash/zsh: persist in your rc file
 ```
 
-If something feels off - a profile stops matching, a mapping points
-nowhere - run `clsw doctor`. It checks the live login, the identity
-cache, every saved profile, the repo mappings, and the lock, and tells
-you how to fix what it finds. It never changes anything itself.
-
-### First-time setup
+The first `claude` in a new directory prompts you to pick a profile;
+the choice is remembered for that directory tree. Resolution order:
+explicit `link` beats `default` beats prompting. Bypass once with
+`CLAUDE_SWITCH_BYPASS=1 claude`.
 
 ```sh
-# 1. Sign in as yourself in Claude Code, then snapshot it.
-claude                          # /login, complete OAuth, quit
-clsw save personal
-# -> saved profile: personal (you@personal.example)
-
-# 2. Add a second account. `clsw add` launches claude under a bypass
-#    so the shell wrapper (if installed) won't intercept.
-clsw add work
-# follow the /logout + /login prompts, quit claude when done
-# -> saved profile: work (you@company.example)
-
-# 3. List them.
-clsw list
-#     NAME        EMAIL                      TIER      FLAGS
-#   * work        you@company.example        max
-#     personal    you@personal.example       max
+clsw link work            # link the cwd to 'work' and switch now
+clsw default personal     # fallback for all unmanaged dirs
 ```
-
-From here, switch with `clsw use <name>` as in the quick start above.
-
-### Auto-switch per directory (the shell wrapper)
-
-Install the wrapper once so `claude` picks the right account based on the
-directory you run it in.
-
-```sh
-# fish:
-clsw init-shell fish | source
-# and to persist it:
-clsw init-shell fish > ~/.config/fish/functions/claude.fish
-
-# bash:
-eval "$(clsw init-shell bash)"
-# and to persist it, append the same into ~/.bashrc
-
-# zsh:
-eval "$(clsw init-shell zsh)"
-# and to persist it, append the same into ~/.zshrc
-```
-
-The first time you run `claude` in an unmanaged directory you'll get a
-prompt:
-
-```
-[claudeswitch] no Claude profile set for: /Users/you/src/acme-api
-
-  1) use personal  (you@personal.example)
-  2) use work      (you@company.example)
-  3) add a new profile (log in as another account)
-  4) do not manage this directory
-  5) set a default profile for all unmanaged dirs
-choose [1-5, or q to cancel]:
-```
-
-Your choice is remembered for that directory (and its subdirectories) in
-`~/.config/claudeswitch/repos.json`. Subsequent `claude` invocations inside
-that tree switch accounts silently.
-
-### Default fallback
-
-If most of your repos should use the same account, set a default and skip
-the prompt:
-
-```sh
-clsw default personal      # make 'personal' the fallback for unmanaged dirs
-clsw default               # -> personal
-clsw default --clear       # stop falling back; resume prompting
-```
-
-Resolution order when you run `claude`:
-
-1. Explicit mapping for the cwd (or any ancestor) - use it.
-2. No mapping, but a default is set - use the default silently.
-3. No mapping and no default - prompt.
-
-### Managing mappings
-
-```sh
-clsw link work               # link the cwd to 'work' AND switch to it now
-clsw link work ~/src/acme    # link a different directory (no switch)
-clsw unlink                  # remove the mapping for cwd
-clsw which                   # show what would be used here, and why
-# -> work (inherited from /Users/you/src)
-# -> personal (default)
-# -> (unmanaged - mapped at /Users/you/throwaway)
-```
-
-Linking the cwd also activates the profile right then, so the change
-takes effect even if you don't have the shell wrapper installed.
-Linking a different directory just records the mapping; the wrapper
-applies it the next time you run `claude` there. Links beat the default
-(see the resolution order above), so linking a repo pins it no matter
-how you change the fallback later.
-
-### Bypassing the wrapper
-
-Set `CLAUDE_SWITCH_BYPASS=1` to skip `clsw ensure` for a single command:
-
-```sh
-CLAUDE_SWITCH_BYPASS=1 claude
-```
-
-`clsw add` sets this automatically when it launches `claude` for you to log
-in, so you can safely `add` a new profile from inside any managed
-directory.
 
 ## Isolated profiles
 
-By default a profile is a snapshot of the one global login ("blob" mode):
-switching rewrites the credential store, running sessions have to be
-restarted, and only one account can be live at a time.
+A normal profile swaps credentials in and out of Claude Code's single
+global login. Running sessions keep their account in memory, so
+different tabs can already be on different accounts - but they all
+share one credential store: every background token refresh writes to
+the same slot, so concurrent sessions overwrite each other's rotated
+tokens, and claudeswitch has to patch up the drift on every switch.
 
-An **isolated** profile instead owns a whole Claude config dir of its own
-under `~/.config/claudeswitch/homes/<name>`. The shell wrapper launches
-`claude` with `CLAUDE_CONFIG_DIR` pointing at it, which means:
-
-- **Concurrent accounts.** A work repo in one terminal and a personal
-  repo in another each run as their own account, at the same time.
-- **No restarts.** Switching directories never rewrites the global
-  credential store, so nothing needs restarting.
-- **No token-rotation fragility.** Each account's tokens live in exactly
-  one place; there is nothing to snapshot or drift.
+An **isolated** profile removes the sharing. It owns its own Claude
+config dir under `~/.config/claudeswitch/homes/<name>`, and the wrapper
+launches `claude` with `CLAUDE_CONFIG_DIR` pointing there - each
+account refreshes into its own store, nothing fights, and switching
+never touches a running session.
 
 ```sh
-clsw isolate work        # convert an existing profile
-clsw add --isolated ops  # or create a new one, isolated from the start
-clsw link work ~/src/acme-api
-cd ~/src/acme-api && claude    # runs inside work's own config dir
+clsw isolate work         # convert an existing profile
+clsw add --isolated ops   # or start one fresh
+eval "$(clsw env work)"   # use without the wrapper (fish: ... | source)
 ```
 
-Without the wrapper (or in scripts), load one into the current shell:
-
-```sh
-eval "$(clsw env work)"        # bash/zsh
-clsw env --shell fish work | source   # fish
-```
-
-The tradeoff: an isolated home is a separate Claude Code world.
-Session history, per-user settings, and MCP logins live inside it, not
-in `~/.claude`. `clsw isolate` seeds the new home with your theme and
-onboarding state, but the rest starts fresh.
-
-Two behaviors worth knowing:
-
-- Isolating the profile you're currently logged in as also logs out the
-  global store. Both copies would otherwise hold the same refresh token,
-  and whichever refreshed first would invalidate the other.
-- `clsw rm` on an isolated profile deletes the only copy of that login
-  (and its per-profile history), so it asks first.
-
-If you installed the wrapper before v0.3.0, re-run `./install.sh` (or
-re-eval `clsw init-shell <shell>`) - the old wrapper doesn't know how to
-put `claude` inside a profile's home.
+Tradeoffs: the home is a separate Claude Code world (its own history,
+settings, MCP logins). Isolating the account you're currently logged in
+as also logs out the global store - two copies of one refresh token
+invalidate each other. `rm` on an isolated profile asks first, since it
+deletes the only copy of that login. Wrappers installed before v0.3.0
+must be reinstalled.
 
 ## How it works
 
-Claude Code stores its OAuth credentials as a single JSON blob. That blob -
-not a config file - is what defines "who you're signed in as." Where the
-blob lives depends on your platform, and `claudeswitch` reads and writes
-from the same place Claude Code does:
-
-- **macOS:** the system Keychain, service `Claude Code-credentials`
-- **Linux / Windows:** `~/.claude/.credentials.json` (mode `0600`)
-
-What each command does:
-
-- `save <name>` reads the live blob and writes it to
-  `~/.config/claudeswitch/profiles/<name>.json` (mode `0600`), along with
-  an identity snapshot from `~/.claude.json` (`userID`, `oauthAccount`,
-  `hasAvailableSubscription`). The snapshot is needed because Claude Code
-  caches "who am I" in `~/.claude.json` and trusts that cache over the
-  credential store for things like the displayed email and subscription
-  state. If `~/.claude.json` has no identity at save time, the profile
-  records no snapshot (and `use` will say so). Re-saving over an existing
-  profile prompts for confirmation unless the live credentials are the
-  same account - that's just a refresh, so it proceeds silently.
-- `use <name>` first snapshots the outgoing profile (Claude Code may have
-  just rotated its refresh token in the background, and the rotated token
-  is the only one the auth server will still accept), then writes the
-  saved blob into the credential store and splices the saved identity
-  subtree back into `~/.claude.json` so the UI matches the token.
-- `current` / `list` identify the active profile by hashing the refresh
-  token and matching against saved profiles. If the fingerprint has
-  drifted (refresh tokens rotate on use), they fall back to the email
-  cached in `~/.claude.json` and the last profile claudeswitch activated
-  (recorded in `~/.config/claudeswitch/active`). If those two disagree,
-  the profile is treated as unknown rather than guessed at, since a wrong
-  guess would snapshot the live credentials into the wrong profile.
-  API-key profiles only ever match by exact fingerprint - API keys don't
-  rotate, so a drifted fingerprint rules them out.
-- `ensure` (called by the shell wrapper) walks up from the cwd looking for
-  a mapping in `~/.config/claudeswitch/repos.json`, falls back to the
-  default, then prompts if neither exists.
-- anything that mutates state (`use`, `save`, `rm`, `ensure`'s
-  auto-switch, mapping edits) first takes a lock at
-  `~/.config/claudeswitch/.lock`, so shells running in parallel can't
-  interleave a snapshot with a switch. Locks left behind by a crashed run
-  are stolen automatically once the owning process is gone.
-
-State lives in `~/.config/claudeswitch/`:
-
-```
-profiles/<name>.json   # per-profile snapshot (mode 0600)
-homes/<name>/          # isolated profiles: that profile's CLAUDE_CONFIG_DIR
-repos.json             # { "/abs/repo/path": "profile_name_or_-" }
-default                # single line: default profile name
-active                 # single line: last profile activated or saved
-```
-
-Nothing else is touched - no symlink swapping, no daemons, no background
-state.
+Claude Code stores auth as one credential blob (macOS: Keychain service
+`Claude Code-credentials`; elsewhere `~/.claude/.credentials.json`)
+plus a "who am I" cache in `~/.claude.json`. `save` snapshots both into
+`~/.config/claudeswitch/profiles/<name>.json` (mode `0600`). `use`
+first re-snapshots the outgoing profile (refresh tokens rotate), then
+writes the saved blob back and splices the identity cache so the UI
+matches the token. `current`/`list` match by token fingerprint, falling
+back to the cached email and the last profile activated - and report
+"unsaved" instead of guessing when those disagree. Every mutation takes
+a lock, so parallel shells can't corrupt a profile. All state lives in
+`~/.config/claudeswitch/` - no daemons, no symlink games.
 
 ## Caveats
 
-- **Restart `claude` after switching blob profiles.** A running session
-  holds its tokens in memory and won't notice the credential change until
-  it's restarted. (Isolated profiles don't have this problem.)
-- **Profile files contain live OAuth tokens.** They're written with mode
-  `0600`, but treat `~/.config/claudeswitch/` the same way you'd treat
-  `~/.ssh/` - don't commit it, don't sync it to places you don't trust.
-- **Keychain writes briefly expose the blob in `ps` output.** macOS
-  `security add-generic-password` only accepts the secret as a
-  command-line argument, so while a switch writes the Keychain the blob
-  is visible in the process list. Harmless on a single-user machine;
-  worth knowing on shared ones.
-- **Refresh tokens rotate.** Handled automatically: `use` snapshots the
-  outgoing profile before switching so a rotated token isn't lost, and
-  `list` / `current` fall back to matching by email when the fingerprint
-  has drifted. You only need to re-`save` if a profile's identity (email
-  or subscription) actually changed.
-- **macOS may prompt for Keychain access** the first time the script reads
-  or writes the entry from a new terminal. Click "Always Allow" to skip
-  future prompts.
-- **Mappings are central, not in-repo.** `repos.json` lives in your home
-  config dir so cloning a shared repo on a new machine won't silently pull
-  in someone else's work/personal labels. The tradeoff: you re-link on a
-  fresh machine.
-- **Save when store and cache agree.** `save` captures the credential
-  store AND the identity cached in `~/.claude.json`, and those are only
-  guaranteed to describe the same account right after a `/login` (or a
-  `clsw use`). If you've been logging in and out manually, do a fresh
-  `/logout` + `/login` before saving.
+- Restart `claude` after switching a non-isolated profile - running
+  sessions hold their tokens in memory.
+- Profile files and homes hold live OAuth tokens. Treat
+  `~/.config/claudeswitch/` like `~/.ssh/`.
+- macOS: `security` briefly exposes the blob in `ps` output during
+  writes, and may ask for Keychain access once per terminal (choose
+  "Always Allow").
+- `save` right after a `/login` (or a `clsw use`), when the credential
+  store and the identity cache are guaranteed to agree.
+- Directory mappings are per-machine, not stored in the repo.
 
 ## Development
 
-```sh
-make check     # shellcheck + the bats test suite
-make test      # just the tests
-```
-
-Requires [bats-core](https://github.com/bats-core/bats-core) >= 1.4
-(`brew install bats-core` / `apt install bats`) and `shellcheck`. The
-suite runs entirely inside a per-test sandbox: `HOME` and the config
-dirs point into a temp dir, and fake `uname` and `security` binaries in
-`tests/fakebin/` let it exercise both the macOS Keychain path and the
-Linux file path on any host. No test can touch your real credentials.
-CI runs the suite on Ubuntu and macOS for every push and PR.
-
-Tests must use the `assert_*` helpers from `tests/helpers/common.bash`
-instead of bare `[[ ]]`: bash 3.2 (macOS `/bin/bash`, which runs the
-suite there) has an errexit bug that silently ignores a failing `[[ ]]`,
-turning such assertions into no-ops. `make lint` enforces this.
+`make check` runs shellcheck plus the bats suite (needs
+[bats-core](https://github.com/bats-core/bats-core) >= 1.4). Tests run
+in a per-test sandbox with fake `uname`/`security` shims, so both the
+Keychain and file-store paths run on any host and your real credentials
+are never touched. CI covers Ubuntu and macOS. Use the `assert_*`
+helpers instead of bare `[[ ]]` - `make lint` enforces this, and
+`tests/helpers/common.bash` explains why.
 
 ## Uninstall
 
 ```sh
-./install.sh --uninstall           # removes symlinks and the shell wrapper
-rm -rf ~/.config/claudeswitch      # (optional) also remove saved profiles + mappings
+./install.sh --uninstall        # removes symlinks and the shell wrapper
+rm -rf ~/.config/claudeswitch   # optional: also remove profiles + mappings
 ```
 
-This doesn't touch your stored credentials or `~/.claude.json`, so your
-current Claude Code login remains intact.
+Your current Claude Code login stays intact.
