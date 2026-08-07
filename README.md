@@ -1,5 +1,7 @@
 # claudeswitch
 
+[![ci](https://github.com/sspangs/claudeswitch/actions/workflows/ci.yml/badge.svg)](https://github.com/sspangs/claudeswitch/actions/workflows/ci.yml)
+
 A tiny CLI for juggling multiple Claude Code logins - e.g. a personal
 Claude Max account and a work one - without having to `/logout` and
 re-authenticate every time. Works on macOS, Linux, and Windows (via Git
@@ -27,8 +29,9 @@ Requires `bash` 3.2+ and [`jq`](https://jqlang.github.io/jq/).
 
 That checks for `jq` (offering to install it via Homebrew or `apt-get`),
 symlinks `claudeswitch` and `clsw` into `~/.local/bin`, and offers to
-install the `claude` shell wrapper for your shell. Re-running it is safe -
-the shell-rc block is replaced in place, not duplicated.
+install the `claude` shell wrapper and tab completions for your shell.
+Re-running it is safe - the shell-rc block is replaced in place, not
+duplicated.
 
 Flags:
 
@@ -60,6 +63,8 @@ clsw add  <name>            log in as a new account, then save it as <name>
 clsw use  <name>            make <name> the active login
 clsw list                   list saved profiles (marks active with *)
 clsw current                print the active profile
+clsw show <name>            print a profile's metadata (never the tokens)
+clsw rename <old> <new>     rename a profile (updates links and default)
 clsw paths                  show where claudeswitch keeps state
 clsw rm <name>              delete a saved profile
 ```
@@ -69,6 +74,7 @@ clsw rm <name>              delete a saved profile
 ```
 clsw link [<profile> [dir]]   link current (or given) dir to a profile
 clsw unlink [<dir>]           remove mapping for current (or given) dir
+clsw links                    list all directory mappings
 clsw which [<dir>]            show the effective profile for a dir
 clsw default [<name>]         show / set the fallback profile
 clsw default --clear          clear the fallback profile
@@ -76,6 +82,27 @@ clsw ensure                   internal: used by the shell wrapper
 clsw init-shell <fish|bash|zsh>
                               print a 'claude' shell wrapper to eval
 ```
+
+### Misc
+
+```
+clsw doctor                 check the installation for common problems
+clsw completions <shell>    print tab completions for fish/bash/zsh
+clsw version                print the version
+```
+
+`list`, `current`, `show`, `links`, and `which` accept `--json` for
+scripting (e.g. showing the active profile in a status line):
+
+```sh
+clsw current --json
+# -> {"status":"active","profile":"work","email":"you@company.example","tier":"max"}
+```
+
+If something feels off - a profile stops matching, a mapping points
+nowhere - run `clsw doctor`. It checks the live login, the identity
+cache, every saved profile, the repo mappings, and the lock, and tells
+you how to fix what it finds. It never changes anything itself.
 
 ### First-time setup
 
@@ -272,6 +299,21 @@ state.
   guaranteed to describe the same account right after a `/login` (or a
   `clsw use`). If you've been logging in and out manually, do a fresh
   `/logout` + `/login` before saving.
+
+## Development
+
+```sh
+make check     # shellcheck + the bats test suite
+make test      # just the tests
+```
+
+Requires [bats-core](https://github.com/bats-core/bats-core) >= 1.4
+(`brew install bats-core` / `apt install bats`) and `shellcheck`. The
+suite runs entirely inside a per-test sandbox: `HOME` and the config
+dirs point into a temp dir, and fake `uname` and `security` binaries in
+`tests/fakebin/` let it exercise both the macOS Keychain path and the
+Linux file path on any host. No test can touch your real credentials.
+CI runs the suite on Ubuntu and macOS for every push and PR.
 
 ## Uninstall
 

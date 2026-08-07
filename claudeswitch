@@ -17,6 +17,7 @@
 set -euo pipefail
 
 PROG="$(basename "$0")"
+VERSION="0.2.0"
 SERVICE="Claude Code-credentials"
 PROFILE_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/claudeswitch"
 PROFILE_DIR="$PROFILE_ROOT/profiles"
@@ -903,15 +904,28 @@ cmd_use() {
 }
 
 cmd_current() {
+  local json=0
+  if [ "${1:-}" = "--json" ]; then json=1; shift; fi
+  [ $# -eq 0 ] || die "usage: $PROG current [--json]"
   local name path email tier blob live_email
   name="$(active_profile_name)"
   if [ -z "$name" ]; then
     blob="$(creds_read 2>/dev/null || true)"
+    live_email="$(current_email_from_claude_json)"
+    if [ "$json" -eq 1 ]; then
+      if [ -z "$blob" ]; then
+        jq -cn '{status: "none", profile: null, email: null}'
+      else
+        jq -cn --arg e "$live_email" \
+          '{status: "unsaved", profile: null,
+            email: (if $e == "" then null else $e end)}'
+      fi
+      return
+    fi
     if [ -z "$blob" ]; then
       echo "no active login"
       return
     fi
-    live_email="$(current_email_from_claude_json)"
     if [ -n "$live_email" ]; then
       printf '(unsaved - %s) - run %s save <name> to track it\n' "$live_email" "$PROG"
     else
@@ -922,6 +936,13 @@ cmd_current() {
   path="$(profile_path "$name")"
   email="$(profile_email "$path")"
   tier="$(profile_tier "$path")"
+  if [ "$json" -eq 1 ]; then
+    jq -cn --arg n "$name" --arg e "$email" --arg t "$tier" \
+      '{status: "active", profile: $n,
+        email: (if $e == "" then null else $e end),
+        tier: (if $t == "?" then null else $t end)}'
+    return
+  fi
   printf '%s' "$name"
   [ -n "$email" ] && printf '  %s' "$email"
   [ -n "$tier" ] && [ "$tier" != "?" ] && printf '  [%s]' "$tier"
@@ -929,6 +950,9 @@ cmd_current() {
 }
 
 cmd_list() {
+  local json=0
+  if [ "${1:-}" = "--json" ]; then json=1; shift; fi
+  [ $# -eq 0 ] || die "usage: $PROG list [--json]"
   local active_fp=""
   local active_name
   active_name="$(active_profile_name)"
@@ -942,12 +966,34 @@ cmd_list() {
   shopt -s nullglob
   local files=("$PROFILE_DIR"/*.json)
   if [ ${#files[@]} -eq 0 ]; then
-    echo "no saved profiles - run '$PROG add <name>' or '$PROG save <name>'"
+    if [ "$json" -eq 1 ]; then echo "[]"; else
+      echo "no saved profiles - run '$PROG add <name>' or '$PROG save <name>'"
+    fi
+    return
+  fi
+
+  local f name email tier fp active is_default
+  if [ "$json" -eq 1 ]; then
+    for f in "${files[@]}"; do
+      name="$(basename "$f" .json)"
+      email="$(profile_email "$f")"
+      tier="$(profile_tier "$f")"
+      fp="$(profile_blob "$f" | blob_fingerprint)"
+      active=false
+      [ -n "$active_fp" ] && [ "$fp" = "$active_fp" ] && active=true
+      is_default=false
+      [ "$name" = "$default_name" ] && is_default=true
+      jq -cn --arg n "$name" --arg e "$email" --arg t "$tier" \
+        --argjson a "$active" --argjson d "$is_default" \
+        '{name: $n, email: (if $e == "" then null else $e end),
+          tier: (if $t == "?" then null else $t end),
+          active: $a, default: $d}'
+    done | jq -cs .
     return
   fi
 
   printf '  %-2s %-20s %-32s %-8s %-8s\n' '' 'NAME' 'EMAIL' 'TIER' 'FLAGS'
-  local f name email tier fp mark flags
+  local mark flags
   for f in "${files[@]}"; do
     name="$(basename "$f" .json)"
     email="$(profile_email "$f")"
@@ -1030,31 +1076,154 @@ cmd_unlink() {
 }
 
 cmd_which() {
+  local json=0
+  if [ "${1:-}" = "--json" ]; then json=1; shift; fi
+  [ $# -le 1 ] || die "usage: $PROG which [--json] [<dir>]"
   local target
   target="$(abs_dir "${1:-$PWD}")"
   local hit dir val default_name
   hit="$(find_mapping "$target")"
   default_name="$(get_default)"
 
+  # source: linked | inherited | unmanaged | default | none
+  local source="none" profile="" mapped_at=""
   if [ -n "$hit" ]; then
     dir="${hit%%|*}"
     val="${hit#*|}"
+    mapped_at="$dir"
     if [ "$val" = "$SENTINEL_UNMANAGED" ]; then
-      printf '(unmanaged - mapped at %s)\n' "$dir"
+      source="unmanaged"
+    elif [ "$dir" = "$target" ]; then
+      source="linked"; profile="$val"
     else
-      if [ "$dir" = "$target" ]; then
-        printf '%s (linked)\n' "$val"
-      else
-        printf '%s (inherited from %s)\n' "$val" "$dir"
-      fi
+      source="inherited"; profile="$val"
     fi
+  elif [ -n "$default_name" ]; then
+    source="default"; profile="$default_name"
+  fi
+
+  if [ "$json" -eq 1 ]; then
+    jq -cn --arg t "$target" --arg s "$source" --arg p "$profile" --arg m "$mapped_at" \
+      '{dir: $t, source: $s,
+        profile: (if $p == "" then null else $p end),
+        mapped_at: (if $m == "" then null else $m end)}'
     return
   fi
-  if [ -n "$default_name" ]; then
-    printf '%s (default)\n' "$default_name"
+
+  case "$source" in
+    unmanaged)  printf '(unmanaged - mapped at %s)\n' "$mapped_at" ;;
+    linked)     printf '%s (linked)\n' "$profile" ;;
+    inherited)  printf '%s (inherited from %s)\n' "$profile" "$mapped_at" ;;
+    default)    printf '%s (default)\n' "$profile" ;;
+    none)       echo "(no mapping, no default - would prompt on next 'claude')" ;;
+  esac
+}
+
+cmd_links() {
+  local json=0
+  if [ "${1:-}" = "--json" ]; then json=1; shift; fi
+  [ $# -eq 0 ] || die "usage: $PROG links [--json]"
+  local count=0
+  [ -f "$MAP_FILE" ] && count="$(jq -r 'length' "$MAP_FILE")"
+  if [ "$count" -eq 0 ]; then
+    if [ "$json" -eq 1 ]; then echo "[]"; else echo "no mappings."; fi
     return
   fi
-  echo "(no mapping, no default - would prompt on next 'claude')"
+
+  local dir prof note missing
+  if [ "$json" -eq 1 ]; then
+    while IFS=$'\t' read -r dir prof; do
+      missing=false
+      if [ "$prof" != "$SENTINEL_UNMANAGED" ] && [ ! -f "$(profile_path "$prof")" ]; then
+        missing=true
+      fi
+      jq -cn --arg d "$dir" --arg p "$prof" --arg s "$SENTINEL_UNMANAGED" \
+        --argjson m "$missing" \
+        '{dir: $d,
+          profile: (if $p == $s then null else $p end),
+          unmanaged: ($p == $s), missing: $m}'
+    done < <(jq -r 'to_entries | sort_by(.key)[] | "\(.key)\t\(.value)"' "$MAP_FILE") \
+    | jq -cs .
+    return
+  fi
+
+  while IFS=$'\t' read -r dir prof; do
+    note=""
+    if [ "$prof" = "$SENTINEL_UNMANAGED" ]; then
+      prof="(unmanaged)"
+    elif [ ! -f "$(profile_path "$prof")" ]; then
+      note="  (missing profile)"
+    fi
+    printf '%s -> %s%s\n' "$dir" "$prof" "$note"
+  done < <(jq -r 'to_entries | sort_by(.key)[] | "\(.key)\t\(.value)"' "$MAP_FILE")
+}
+
+cmd_rename() {
+  [ $# -eq 2 ] || die "usage: $PROG rename <old> <new>"
+  valid_name "$1"
+  valid_name "$2"
+  local old="$1" new="$2" oldp newp tmp
+  oldp="$(profile_path "$old")"
+  newp="$(profile_path "$new")"
+  [ -f "$oldp" ] || die "no such profile: $old"
+  [ "$old" = "$new" ] && die "old and new name are the same"
+  [ -e "$newp" ] && die "profile '$new' already exists"
+  lock_acquire
+  mv "$oldp" "$newp"
+  if [ -f "$ACTIVE_FILE" ] && [ "$(tr -d '\n' < "$ACTIVE_FILE")" = "$old" ]; then
+    set_active_record "$new"
+  fi
+  if [ "$(get_default)" = "$old" ]; then
+    set_default "$new"
+  fi
+  if [ -f "$MAP_FILE" ]; then
+    tmp="$(mktemp_for "$MAP_FILE")"
+    jq --arg o "$old" --arg n "$new" \
+      'with_entries(if .value == $o then .value = $n else . end)' \
+      "$MAP_FILE" > "$tmp"
+    mv "$tmp" "$MAP_FILE"
+    chmod 600 "$MAP_FILE"
+  fi
+  printf 'renamed profile: %s -> %s\n' "$old" "$new"
+}
+
+cmd_show() {
+  local json=0
+  if [ "${1:-}" = "--json" ]; then json=1; shift; fi
+  [ $# -eq 1 ] || die "usage: $PROG show [--json] <name>"
+  valid_name "$1"
+  local path fp
+  path="$(profile_path "$1")"
+  [ -f "$path" ] || die "no such profile: $1"
+  # Metadata only - never print the blob itself.
+  fp="$(profile_blob "$path" | blob_fingerprint)"
+  if [ "$json" -eq 1 ]; then
+    jq -c --arg name "$1" --arg fp "$fp" \
+      '{name: $name,
+        email: (if .email == "" then null else .email end),
+        tier: (if .tier == "?" then null else .tier end),
+        store: (if .store == "" then null else .store end),
+        saved_at: .saved_at,
+        fingerprint: (if $fp == "" then null else $fp end),
+        identity_snapshot:
+          (.identity.oauthAccount != null or .identity.userID != null)}' \
+      "$path"
+    return
+  fi
+  jq -r --arg name "$1" --arg fp "$fp" '
+    "name:              \($name)",
+    "email:             \(if .email == "" then "-" else .email end)",
+    "tier:              \(.tier)",
+    "store:             \(if .store == "" then "-" else .store end)",
+    "saved at:          \(.saved_at)",
+    "fingerprint:       \(if $fp == "" then "(none)" else $fp end)",
+    "identity snapshot: \(if .identity.oauthAccount != null or .identity.userID != null
+                          then "yes" else "no (re-save after running claude as this account)" end)"
+  ' "$path"
+}
+
+cmd_version() {
+  printf '%s %s\n' "$PROG" "$VERSION"
 }
 
 cmd_default() {
@@ -1167,6 +1336,182 @@ EOF
   esac
 }
 
+cmd_doctor() {
+  # Report-only: doctor never mutates state. Exit 1 if anything FAILed.
+  local fails=0 warns=0 claude_bin
+  _ok()   { printf 'ok:   %s\n' "$*"; }
+  _warn() { printf 'warn: %s\n' "$*"; warns=$((warns+1)); }
+  _fail() { printf 'FAIL: %s\n' "$*"; fails=$((fails+1)); }
+
+  # dependencies
+  if claude_bin="$(resolve_claude_bin 2>/dev/null)"; then
+    _ok "claude binary: $claude_bin"
+  else
+    _warn "claude binary not found on PATH"
+  fi
+
+  # live credential store
+  local blob store
+  if blob="$(creds_read 2>/dev/null)"; then
+    store="$(creds_store 2>/dev/null || true)"
+    if blob_has_credential "$blob"; then
+      _ok "live login present (store: ${store:-unknown})"
+    else
+      _warn "credential store exists but holds no Claude login (logged out?)"
+    fi
+  else
+    _warn "no live Claude Code login found"
+  fi
+
+  # identity cache
+  if [ -f "$CLAUDE_JSON" ]; then
+    local email
+    email="$(current_email_from_claude_json)"
+    if [ -n "$email" ]; then
+      _ok "identity cache: $email ($CLAUDE_JSON)"
+    else
+      _warn "identity cache has no account identity ($CLAUDE_JSON)"
+    fi
+  else
+    _warn "identity cache missing: $CLAUDE_JSON"
+  fi
+
+  # does the live login map to a saved profile?
+  if [ -n "$blob" ] && blob_has_credential "$blob"; then
+    local active
+    active="$(active_profile_name)"
+    if [ -n "$active" ]; then
+      _ok "live login matches profile: $active"
+    else
+      _warn "live login matches no saved profile - snapshots are disabled until you '$PROG save <name>' it"
+    fi
+  fi
+
+  # saved profiles
+  shopt -s nullglob
+  local f name pblob n_profiles=0
+  for f in "$PROFILE_DIR"/*.json; do
+    n_profiles=$((n_profiles+1))
+    name="$(basename "$f" .json)"
+    if ! jq -e . "$f" >/dev/null 2>&1; then
+      _fail "profile '$name' is not valid JSON: $f"
+      continue
+    fi
+    pblob="$(profile_blob "$f")"
+    if [ -z "$pblob" ] || [ "$pblob" = "null" ]; then
+      _fail "profile '$name' has no credential blob (corrupt) - re-save it"
+      continue
+    fi
+    if ! blob_has_credential "$pblob"; then
+      _fail "profile '$name' holds no Claude login (captured while logged out?) - log in as that account and '$PROG save $name'"
+      continue
+    fi
+    if [ "$(profile_store "$f")" != "state-api-key" ] \
+      && [ "$(jq -r 'if .identity.oauthAccount == null and .identity.userID == null
+                     then "no" else "yes" end' "$f")" = "no" ]; then
+      _warn "profile '$name' has no identity snapshot - run 'claude' as it once, then '$PROG save $name'"
+    else
+      _ok "profile '$name' looks healthy"
+    fi
+  done
+  [ "$n_profiles" -eq 0 ] && _warn "no saved profiles yet - run '$PROG save <name>'"
+
+  # mappings
+  if [ -f "$MAP_FILE" ]; then
+    local dir prof
+    while IFS=$'\t' read -r dir prof; do
+      if [ "$prof" != "$SENTINEL_UNMANAGED" ] && [ ! -f "$(profile_path "$prof")" ]; then
+        _warn "mapping $dir -> '$prof' points at a missing profile"
+      fi
+      if [ ! -d "$dir" ]; then
+        _warn "mapped directory no longer exists: $dir"
+      fi
+    done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$MAP_FILE" 2>/dev/null)
+  fi
+
+  # default
+  local default_name
+  default_name="$(get_default)"
+  if [ -n "$default_name" ] && [ ! -f "$(profile_path "$default_name")" ]; then
+    _warn "default profile '$default_name' does not exist"
+  fi
+
+  # stale lock
+  if [ -d "$LOCK_DIR" ]; then
+    local pid
+    pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      _warn "lock currently held by pid $pid ($LOCK_DIR)"
+    else
+      _warn "stale lock left behind ($LOCK_DIR) - it will be stolen on the next run"
+    fi
+  fi
+
+  # shell wrapper
+  local rc wrapper_found=""
+  for rc in "${XDG_CONFIG_HOME:-$HOME/.config}/fish/functions/claude.fish" \
+            "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.bash_profile"; do
+    if [ -f "$rc" ] && grep -q "claudeswitch ensure" "$rc" 2>/dev/null; then
+      wrapper_found="$rc"
+      break
+    fi
+  done
+  if [ -n "$wrapper_found" ]; then
+    _ok "shell wrapper installed: $wrapper_found"
+  else
+    _warn "shell wrapper not found - per-directory auto-switching is inactive (see '$PROG init-shell')"
+  fi
+
+  echo
+  if [ "$fails" -gt 0 ]; then
+    printf '%d problem(s), %d warning(s)\n' "$fails" "$warns"
+    exit 1
+  fi
+  printf '0 problems, %d warning(s)\n' "$warns"
+}
+
+cmd_completions() {
+  local shell="${1:-}"
+  local subcmds="save add use list current show rename paths rm link unlink links which default doctor init-shell completions version help"
+  local profile_cmds="use rm show rename link default"
+  case "$shell" in
+    fish)
+      local prog
+      for prog in claudeswitch clsw; do
+        printf 'complete -c %s -f\n' "$prog"
+        printf 'complete -c %s -n __fish_use_subcommand -a "%s"\n' "$prog" "$subcmds"
+        printf 'complete -c %s -n "__fish_seen_subcommand_from %s" -a "(claudeswitch _profiles 2>/dev/null)"\n' "$prog" "$profile_cmds"
+        printf 'complete -c %s -n "__fish_seen_subcommand_from init-shell completions" -a "fish bash zsh"\n' "$prog"
+      done
+      ;;
+    bash|zsh)
+      [ "$shell" = "zsh" ] && cat <<'EOF'
+autoload -Uz bashcompinit && bashcompinit
+EOF
+      cat <<EOF
+_claudeswitch() {
+  local cur
+  cur="\${COMP_WORDS[COMP_CWORD]}"
+  if [ "\$COMP_CWORD" -eq 1 ]; then
+    COMPREPLY=(\$(compgen -W "$subcmds" -- "\$cur"))
+    return
+  fi
+  case "\${COMP_WORDS[1]}" in
+    use|rm|show|rename|link|default)
+      COMPREPLY=(\$(compgen -W "\$(claudeswitch _profiles 2>/dev/null)" -- "\$cur")) ;;
+    init-shell|completions)
+      COMPREPLY=(\$(compgen -W "fish bash zsh" -- "\$cur")) ;;
+  esac
+}
+complete -F _claudeswitch claudeswitch clsw
+EOF
+      ;;
+    *)
+      die "usage: $PROG completions <fish|bash|zsh>"
+      ;;
+  esac
+}
+
 cmd_paths() {
   printf 'profiles: %s\n' "$PROFILE_DIR"
   printf 'repo map: %s\n' "$MAP_FILE"
@@ -1183,20 +1528,29 @@ profile management:
   $PROG save <name>            snapshot the current login as <name>
   $PROG add  <name>            log in as a new account, then save it as <name>
   $PROG use  <name>            make <name> the active login
-  $PROG list                   list saved profiles (marks active with *)
-  $PROG current                print the active profile
+  $PROG list [--json]          list saved profiles (marks active with *)
+  $PROG current [--json]       print the active profile
+  $PROG show [--json] <name>   print a profile's metadata (never the tokens)
+  $PROG rename <old> <new>     rename a profile (updates links and default)
   $PROG paths                  show where claudeswitch keeps state
   $PROG rm <name>              delete a saved profile
 
 per-directory auto-switching:
   $PROG link [<profile> [dir]] link current (or given) dir to a profile
   $PROG unlink [<dir>]         remove mapping for current (or given) dir
-  $PROG which [<dir>]          show the effective profile for a dir
+  $PROG links [--json]         list all directory mappings
+  $PROG which [--json] [<dir>] show the effective profile for a dir
   $PROG default [<name>]       show / set the fallback profile
   $PROG default --clear        clear the fallback profile
   $PROG ensure                 internal: used by the shell wrapper
   $PROG init-shell <fish|bash|zsh>
                                print a 'claude' shell wrapper to eval
+
+misc:
+  $PROG doctor                 check the installation for common problems
+  $PROG completions <fish|bash|zsh>
+                               print shell completions to source
+  $PROG version                print the version
 
 the wrapper will prompt the first time you run \`claude\` in an
 unmanaged directory. set \$CLAUDE_SWITCH_BYPASS=1 to skip the wrapper.
@@ -1214,14 +1568,21 @@ case "$cmd" in
   use|switch)         cmd_use        "$@" ;;
   list|ls)            cmd_list       "$@" ;;
   current|who)        cmd_current    "$@" ;;
+  show|info)          cmd_show       "$@" ;;
+  rename|mv)          cmd_rename     "$@" ;;
   paths)              cmd_paths      "$@" ;;
   rm|remove|delete)   cmd_rm         "$@" ;;
   link)               cmd_link       "$@" ;;
   unlink)             cmd_unlink     "$@" ;;
+  links|mappings)     cmd_links      "$@" ;;
   which)              cmd_which      "$@" ;;
   default)            cmd_default    "$@" ;;
   ensure)             cmd_ensure     "$@" ;;
   init-shell)         cmd_init_shell "$@" ;;
+  doctor)             cmd_doctor     "$@" ;;
+  completions)        cmd_completions "$@" ;;
+  _profiles)          list_profile_names  ;;
+  version|--version|-V) cmd_version       ;;
   help|-h|--help)     cmd_help            ;;
   *) die "unknown command: '$cmd' (try '$PROG help')" ;;
 esac

@@ -35,7 +35,8 @@ What it does:
   1. Verifies jq is installed (offers to 'brew install' on macOS,
      else prints a platform-specific hint).
   2. Symlinks 'claudeswitch' and 'clsw' into ~/.local/bin.
-  3. Optionally installs the 'claude' shell wrapper for fish/bash/zsh.
+  3. Optionally installs the 'claude' shell wrapper and tab completions
+     for fish/bash/zsh.
 
 Supported platforms: macOS, Linux, Windows (Git Bash or WSL).
 EOF
@@ -177,6 +178,26 @@ remove_fish_wrapper() {
   fi
 }
 
+write_fish_completions() {
+  local dir="$HOME/.config/fish/completions"
+  mkdir -p "$dir"
+  # fish loads completions lazily by command name, so both names need a file.
+  "$REPO_MAIN" completions fish > "$dir/claudeswitch.fish"
+  cp "$dir/claudeswitch.fish" "$dir/clsw.fish"
+  ok "wrote fish completions to $dir"
+}
+
+remove_fish_completions() {
+  local f
+  for f in "$HOME/.config/fish/completions/claudeswitch.fish" \
+           "$HOME/.config/fish/completions/clsw.fish"; do
+    if [ -f "$f" ] && grep -q 'claudeswitch' "$f"; then
+      rm -f "$f"
+      ok "removed $f"
+    fi
+  done
+}
+
 strip_rc_block() {
   local rc="$1"
   [ -f "$rc" ] || return 0
@@ -210,9 +231,10 @@ write_rc_wrapper() {
     printf '%s\n' "$MARKER_START"
     printf '# Managed by install.sh. Run ./install.sh --uninstall to remove.\n'
     printf '%s\n' "$wrapper"
+    "$REPO_MAIN" completions "$shell"
     printf '%s\n' "$MARKER_END"
   } >> "$rc"
-  ok "added wrapper block to $rc"
+  ok "added wrapper and completions block to $rc"
 }
 
 maybe_install_wrapper() {
@@ -227,7 +249,7 @@ maybe_install_wrapper() {
     return
   fi
   case "$shell" in
-    fish)     write_fish_wrapper ;;
+    fish)     write_fish_wrapper; write_fish_completions ;;
     bash|zsh) write_rc_wrapper "$shell" ;;
     *) info "unknown shell: $shell; skipping" ;;
   esac
@@ -235,6 +257,7 @@ maybe_install_wrapper() {
 
 remove_wrapper() {
   remove_fish_wrapper
+  remove_fish_completions
   strip_rc_block "$HOME/.bashrc"
   strip_rc_block "$HOME/.zshrc"
 }
