@@ -88,6 +88,11 @@ clsw add --isolated ops   # or start one fresh
 eval "$(clsw env work)"   # use without the wrapper (fish: ... | source)
 ```
 
+Recommended setup: leave your main account global (so IDE extensions,
+scripts, and plain `claude` all see it) and isolate the secondary ones.
+The accounts then share nothing, and the main login keeps working from
+every entry point, wrapper or not.
+
 Tradeoffs: the home is a separate Claude Code world (its own history,
 settings, MCP logins). Isolating the account you're currently logged in
 as also logs out the global store - two copies of one refresh token
