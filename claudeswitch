@@ -534,7 +534,7 @@ identity_from_claude_json() {
 splice_identity_into_claude_json() {
   local identity="$1" tmp
   [ -f "$CLAUDE_JSON" ] || return 0
-  [ -n "$identity" ] && [ "$identity" != "null" ] || return 0
+  if [ -z "$identity" ] || [ "$identity" = "null" ]; then return 0; fi
   tmp="$(mktemp_for "$CLAUDE_JSON")"
   jq --argjson id "$identity" '
     (if $id.userID then .userID = $id.userID else . end)
@@ -1236,8 +1236,9 @@ cmd_rm() {
   if [ "$mode" = "isolated" ] && [ -n "$home" ]; then
     case "$home" in
       "$HOMES_DIR"/*)
-        [ "$PLATFORM" = "macos" ] \
-          && security delete-generic-password -s "$(service_for_dir "$home")" >/dev/null 2>&1 || true
+        if [ "$PLATFORM" = "macos" ]; then
+          security delete-generic-password -s "$(service_for_dir "$home")" >/dev/null 2>&1 || true
+        fi
         rm -rf -- "$home"
         ;;
       *) info "home $home is outside $HOMES_DIR - not deleting it" ;;
