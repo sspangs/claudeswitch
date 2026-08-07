@@ -17,10 +17,12 @@
 set -euo pipefail
 
 PROG="$(basename "$0")"
-VERSION="0.2.0"
-SERVICE="Claude Code-credentials"
+VERSION="0.3.0"
+SERVICE_BASE="Claude Code-credentials"
+SERVICE="$SERVICE_BASE"
 PROFILE_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/claudeswitch"
 PROFILE_DIR="$PROFILE_ROOT/profiles"
+HOMES_DIR="$PROFILE_ROOT/homes"
 MAP_FILE="$PROFILE_ROOT/repos.json"
 DEFAULT_FILE="$PROFILE_ROOT/default"
 ACTIVE_FILE="$PROFILE_ROOT/active"
@@ -368,6 +370,125 @@ profile_blob()  { jq -r '.blob'         "$1"; }
 profile_email() { jq -r '.email // ""'  "$1"; }
 profile_tier()  { jq -r '.tier  // "?"' "$1"; }
 profile_store() { jq -r '.store // ""'  "$1"; }
+profile_mode()  { jq -r '.mode // "blob"' "$1"; }
+profile_home()  { jq -r '.home // ""'   "$1"; }
+
+# --- isolated profiles -----------------------------------------------------
+# An isolated profile owns a whole Claude config dir ($HOMES_DIR/<name>)
+# instead of a credential blob. The shell wrapper launches claude with
+# CLAUDE_CONFIG_DIR (and CLAUDE_SECURESTORAGE_CONFIG_DIR) pointing at it,
+# so different terminals can run different accounts at the same time and
+# nothing ever rewrites the global credential store.
+
+home_for() { printf '%s/%s' "$HOMES_DIR" "$1"; }
+
+# The keychain service Claude Code derives for a config dir it was
+# launched with (we always set CLAUDE_SECURESTORAGE_CONFIG_DIR to the
+# home, so the suffix is always present).
+service_for_dir() {
+  printf '%s-%s' "$SERVICE_BASE" \
+    "$(printf '%s' "$1" | sha256_digest | cut -c1-8)"
+}
+
+isolated_creds_read() {
+  local home="$1" raw
+  if [ -f "$home/.claude.json" ]; then
+    if raw="$(jq -cer 'select(.primaryApiKey? and .primaryApiKey != "")
+        | {primaryApiKey: .primaryApiKey}' "$home/.claude.json" 2>/dev/null)"; then
+      printf '%s' "$raw"
+      return 0
+    fi
+  fi
+  if [ -f "$home/.credentials.json" ]; then
+    cat "$home/.credentials.json"
+    return 0
+  fi
+  if [ "$PLATFORM" = "macos" ]; then
+    raw="$(security find-generic-password -s "$(service_for_dir "$home")" -w 2>/dev/null)" || return 1
+    if printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
+      printf '%s' "$raw"
+    else
+      CLSW_KEY="$raw" jq -cn '{primaryApiKey: env.CLSW_KEY}'
+    fi
+    return 0
+  fi
+  return 1
+}
+
+isolated_creds_write() {
+  local home="$1" blob="$2" store="$3" tmp acct
+  case "$store" in
+    state-api-key)
+      tmp="$(mktemp_for "$home/.claude.json")"
+      CLSW_BLOB="$blob" jq '.primaryApiKey = (env.CLSW_BLOB | fromjson | .primaryApiKey)' \
+        "$home/.claude.json" > "$tmp"
+      mv "$tmp" "$home/.claude.json"
+      chmod 600 "$home/.claude.json"
+      ;;
+    keychain-api-key)
+      security add-generic-password -s "$(service_for_dir "$home")" -a "$USER" \
+        -w "$(printf '%s' "$blob" | jq -r '.primaryApiKey')" -U >/dev/null
+      ;;
+    file)
+      ( umask 077; printf '%s' "$blob" > "$home/.credentials.json" )
+      chmod 600 "$home/.credentials.json"
+      ;;
+    keychain|*)
+      if [ "$PLATFORM" = "macos" ]; then
+        security add-generic-password -s "$(service_for_dir "$home")" -a "$USER" \
+          -w "$blob" -U >/dev/null
+      else
+        ( umask 077; printf '%s' "$blob" > "$home/.credentials.json" )
+        chmod 600 "$home/.credentials.json"
+      fi
+      ;;
+  esac
+}
+
+isolated_email() {
+  [ -f "$1/.claude.json" ] || return 0
+  jq -r '.oauthAccount.emailAddress // ""' "$1/.claude.json" 2>/dev/null || true
+}
+
+isolated_tier() {
+  local creds
+  creds="$(isolated_creds_read "$1" 2>/dev/null || true)"
+  if [ -z "$creds" ]; then printf '?'; return; fi
+  printf '%s' "$creds" \
+    | jq -r 'if .primaryApiKey then "api" else (.claudeAiOauth.subscriptionType // "?") end'
+}
+
+# Seed a fresh home's .claude.json: the identity subtree (if any) plus a
+# few comfort fields copied from the primary config so the first run in
+# the new home doesn't repeat onboarding.
+seed_home_claude_json() {
+  local home="$1" identity="${2:-null}" base
+  base='{}'
+  if [ -f "$CLAUDE_JSON" ]; then
+    base="$(jq -c '{theme: .theme, hasCompletedOnboarding: .hasCompletedOnboarding}
+      | with_entries(select(.value != null))' "$CLAUDE_JSON" 2>/dev/null || printf '{}')"
+  fi
+  ( umask 077
+    jq -cn --argjson base "$base" --argjson id "$identity" '
+      $base
+      | (if $id and $id.userID then .userID = $id.userID else . end)
+      | (if $id and $id.oauthAccount then .oauthAccount = $id.oauthAccount else . end)
+      | (if $id and $id.hasAvailableSubscription != null
+           then .hasAvailableSubscription = $id.hasAvailableSubscription
+           else . end)
+    ' > "$home/.claude.json" )
+  chmod 600 "$home/.claude.json"
+}
+
+build_isolated_envelope() {
+  local home="$1" email tier saved_at
+  email="$(isolated_email "$home")"
+  tier="$(isolated_tier "$home")"
+  saved_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  jq -cn --arg home "$home" --arg email "$email" --arg tier "$tier" \
+    --arg saved_at "$saved_at" \
+    '{mode: "isolated", home: $home, email: $email, tier: $tier, saved_at: $saved_at}'
+}
 
 blob_fingerprint() {
   # Empty output means "no fingerprint". Callers must never treat two
@@ -489,6 +610,9 @@ active_profile_name() {
 
   if [ -n "$email" ]; then
     for f in "$PROFILE_DIR"/*.json; do
+      # Isolated profiles never own the global store; matching one here
+      # would corrupt its envelope on the next snapshot.
+      [ "$(profile_mode "$f")" = "isolated" ] && continue
       if [ "$(profile_email "$f")" = "$email" ]; then
         if [ -n "$match" ]; then ambiguous=1; break; fi
         match="$(basename "$f" .json)"
@@ -515,6 +639,8 @@ active_profile_name() {
   fi
 
   if [ -n "$recorded" ]; then
+    # Isolated profiles never own the global store.
+    [ "$(profile_mode "$(profile_path "$recorded")")" = "isolated" ] && return 0
     # API keys never rotate, so a fingerprint miss rules an API-key
     # profile out; only OAuth tokens drift out of sync.
     if [ "$(profile_blob "$(profile_path "$recorded")" \
@@ -536,6 +662,9 @@ snapshot_active_profile() {
   [ -n "$name" ] || return 0
   path="$(profile_path "$name")"
   [ -f "$path" ] || return 0
+  # Belt and suspenders: a snapshot into an isolated envelope would
+  # replace it with a blob envelope and orphan the home.
+  [ "$(profile_mode "$path")" = "isolated" ] && return 0
 
   live="$(creds_read 2>/dev/null || true)"
   [ -n "$live" ] || return 0
@@ -633,6 +762,26 @@ ensure_active() {
   info "switched to profile: $want"
 }
 
+# Make $1 the effective profile for a `claude` run. Blob profiles are
+# switched into the global store (nothing on stdout); isolated profiles
+# print their home dir on stdout for the shell wrapper to capture and
+# pass as CLAUDE_CONFIG_DIR - the global store is left untouched.
+apply_profile() {
+  local want="$1" path
+  path="$(profile_path "$want")"
+  if [ -f "$path" ] && [ "$(profile_mode "$path")" = "isolated" ]; then
+    if [ -t 1 ]; then
+      # stdout is a terminal: nothing is capturing the home dir, so the
+      # wrapper predates isolated profiles (or isn't installed).
+      info "profile '$want' is isolated - your 'claude' wrapper looks outdated;"
+      info "re-run ./install.sh (or re-eval '$PROG init-shell <shell>') to update it"
+    fi
+    printf '%s\n' "$(profile_home "$path")"
+    return 0
+  fi
+  ensure_active "$want"
+}
+
 # --- prompt flow (used by `ensure` and `link` w/o arg) ---------------------
 
 prompt_pick_profile() {
@@ -691,13 +840,18 @@ resolve_claude_bin() {
 }
 
 run_claude_bypassed() {
-  local claude_bin
+  # $1 (optional): config dir to launch claude inside (isolated home).
+  local home="${1:-}" claude_bin
+  local envs=(CLAUDE_SWITCH_BYPASS=1)
+  if [ -n "$home" ]; then
+    envs+=("CLAUDE_CONFIG_DIR=$home" "CLAUDE_SECURESTORAGE_CONFIG_DIR=$home")
+  fi
   claude_bin="$(resolve_claude_bin)" || die "missing dependency: claude"
   info "launching Claude Code: $claude_bin"
   if [ -r /dev/tty ] && [ -w /dev/tty ]; then
-    env CLAUDE_SWITCH_BYPASS=1 "$claude_bin" </dev/tty >/dev/tty 2>&1
+    env "${envs[@]}" "$claude_bin" </dev/tty >/dev/tty 2>&1
   else
-    env CLAUDE_SWITCH_BYPASS=1 "$claude_bin"
+    env "${envs[@]}" "$claude_bin"
   fi
 }
 
@@ -797,7 +951,7 @@ prompt_and_resolve() {
       local picked="${names[$((choice-1))]}"
       set_mapping "$target" "$picked"
       info "linked $target -> $picked"
-      ensure_active "$picked"
+      apply_profile "$picked"
       return 0
     elif [ "$choice" -eq "$add_idx" ]; then
       local new_name
@@ -805,7 +959,7 @@ prompt_and_resolve() {
       new_name="$PROMPT_NEW_PROFILE_NAME"
       set_mapping "$target" "$new_name"
       info "linked $target -> $new_name"
-      ensure_active "$new_name"
+      apply_profile "$new_name"
       return 0
     elif [ "$choice" -eq "$skip_idx" ]; then
       set_mapping "$target" "$SENTINEL_UNMANAGED"
@@ -816,7 +970,7 @@ prompt_and_resolve() {
       picked="$(prompt_pick_profile "default profile")" || continue
       set_default "$picked"
       info "default profile set to: $picked"
-      ensure_active "$picked"
+      apply_profile "$picked"
       return 0
     else
       echo "invalid choice." >&2
@@ -831,6 +985,10 @@ cmd_save() {
   valid_name "$1"
   local name="$1" path blob email envelope store live_fp saved_fp
   path="$(profile_path "$name")"
+
+  if [ -f "$path" ] && [ "$(profile_mode "$path")" = "isolated" ]; then
+    die "profile '$name' is isolated - its login lives in its own config dir and never needs saving"
+  fi
 
   # Prompt before taking the lock so a lingering prompt can't block
   # other invocations. Skip the prompt when the live credentials carry the
@@ -865,6 +1023,12 @@ cmd_save() {
 cmd_use() {
   [ $# -eq 1 ] || die "usage: $PROG use <name>"
   valid_name "$1"
+  if [ -f "$(profile_path "$1")" ] \
+    && [ "$(profile_mode "$(profile_path "$1")")" = "isolated" ]; then
+    die "profile '$1' is isolated - it can't be switched into the global store.
+Run 'claude' in a directory linked to it (with the shell wrapper installed),
+or load it into this shell with:  $PROG env $1"
+  fi
   lock_acquire
 
   # Preserve any token Claude refreshed in the outgoing profile - otherwise
@@ -910,6 +1074,35 @@ cmd_current() {
   if [ "${1:-}" = "--json" ]; then json=1; shift; fi
   [ $# -eq 0 ] || die "usage: $PROG current [--json]"
   local name path email tier blob live_email
+
+  # Inside an isolated session? (The wrapper exports CLAUDE_CONFIG_DIR,
+  # so a `clsw current` run from within it can identify the profile.)
+  if [ -n "$_ENV_CLAUDE_CONFIG_DIR" ]; then
+    shopt -s nullglob
+    local f
+    for f in "$PROFILE_DIR"/*.json; do
+      if [ "$(profile_mode "$f")" = "isolated" ] \
+        && [ "$(profile_home "$f")" = "$_ENV_CLAUDE_CONFIG_DIR" ]; then
+        name="$(basename "$f" .json)"
+        email="$(isolated_email "$_ENV_CLAUDE_CONFIG_DIR")"
+        tier="$(isolated_tier "$_ENV_CLAUDE_CONFIG_DIR")"
+        if [ "$json" -eq 1 ]; then
+          jq -cn --arg n "$name" --arg e "$email" --arg t "$tier" \
+            '{status: "active", profile: $n,
+              email: (if $e == "" then null else $e end),
+              tier: (if $t == "?" then null else $t end),
+              isolated: true}'
+          return
+        fi
+        printf '%s' "$name"
+        [ -n "$email" ] && printf '  %s' "$email"
+        [ -n "$tier" ] && [ "$tier" != "?" ] && printf '  [%s]' "$tier"
+        printf '  (isolated)\n'
+        return
+      fi
+    done
+  fi
+
   name="$(active_profile_name)"
   if [ -z "$name" ]; then
     blob="$(creds_read 2>/dev/null || true)"
@@ -974,22 +1167,28 @@ cmd_list() {
     return
   fi
 
-  local f name email tier fp active is_default
+  local f name email tier fp mode active is_default
   if [ "$json" -eq 1 ]; then
     for f in "${files[@]}"; do
       name="$(basename "$f" .json)"
       email="$(profile_email "$f")"
       tier="$(profile_tier "$f")"
+      mode="$(profile_mode "$f")"
+      if [ "$mode" = "isolated" ] && [ -d "$(profile_home "$f")" ]; then
+        # metadata can go stale; the home is authoritative
+        email="$(isolated_email "$(profile_home "$f")")"
+        tier="$(isolated_tier "$(profile_home "$f")")"
+      fi
       fp="$(profile_blob "$f" | blob_fingerprint)"
       active=false
       [ -n "$active_fp" ] && [ "$fp" = "$active_fp" ] && active=true
       is_default=false
       [ "$name" = "$default_name" ] && is_default=true
-      jq -cn --arg n "$name" --arg e "$email" --arg t "$tier" \
+      jq -cn --arg n "$name" --arg e "$email" --arg t "$tier" --arg m "$mode" \
         --argjson a "$active" --argjson d "$is_default" \
         '{name: $n, email: (if $e == "" then null else $e end),
           tier: (if $t == "?" then null else $t end),
-          active: $a, default: $d}'
+          mode: $m, active: $a, default: $d}'
     done | jq -cs .
     return
   fi
@@ -1000,11 +1199,19 @@ cmd_list() {
     name="$(basename "$f" .json)"
     email="$(profile_email "$f")"
     tier="$(profile_tier "$f")"
+    mode="$(profile_mode "$f")"
+    if [ "$mode" = "isolated" ] && [ -d "$(profile_home "$f")" ]; then
+      email="$(isolated_email "$(profile_home "$f")")"
+      tier="$(isolated_tier "$(profile_home "$f")")"
+    fi
     fp="$(profile_blob "$f" | blob_fingerprint)"
     mark=' '
     [ -n "$active_fp" ] && [ "$fp" = "$active_fp" ] && mark='*'
     flags=''
-    [ "$name" = "$default_name" ] && flags='default'
+    [ "$mode" = "isolated" ] && flags='isolated'
+    if [ "$name" = "$default_name" ]; then
+      if [ -n "$flags" ]; then flags="$flags,default"; else flags='default'; fi
+    fi
     printf '  %-2s %-20s %-32s %-8s %-8s\n' "$mark" "$name" "${email:--}" "$tier" "$flags"
   done
 }
@@ -1012,11 +1219,30 @@ cmd_list() {
 cmd_rm() {
   [ $# -eq 1 ] || die "usage: $PROG rm <name>"
   valid_name "$1"
-  local path
+  local path mode home yn
   path="$(profile_path "$1")"
   [ -f "$path" ] || die "no such profile: $1"
+  mode="$(profile_mode "$path")"
+  home=""
+  if [ "$mode" = "isolated" ]; then
+    home="$(profile_home "$path")"
+    # Unlike a blob profile, this deletes the only copy of the login.
+    printf "profile '%s' is isolated - deleting removes its login and per-profile settings/history at\n  %s\ndelete? [y/n] " "$1" "$home"
+    IFS= read -r yn
+    [[ "$yn" =~ ^[Yy]$ ]] || { echo "aborted"; exit 1; }
+  fi
   lock_acquire
   rm -f -- "$path"
+  if [ "$mode" = "isolated" ] && [ -n "$home" ]; then
+    case "$home" in
+      "$HOMES_DIR"/*)
+        [ "$PLATFORM" = "macos" ] \
+          && security delete-generic-password -s "$(service_for_dir "$home")" >/dev/null 2>&1 || true
+        rm -rf -- "$home"
+        ;;
+      *) info "home $home is outside $HOMES_DIR - not deleting it" ;;
+    esac
+  fi
   # Clean up references.
   if [ -f "$ACTIVE_FILE" ] && [ "$(tr -d '\n' < "$ACTIVE_FILE")" = "$1" ]; then
     clear_active_record
@@ -1059,7 +1285,11 @@ cmd_link() {
   # `clsw ensure` before `claude` - which is a common gotcha when the
   # wrapper isn't installed.
   if [ "$target" = "$(abs_dir "$PWD")" ]; then
-    ensure_active "$profile"
+    if [ "$(profile_mode "$(profile_path "$profile")")" = "isolated" ]; then
+      info "profile '$profile' is isolated - it takes effect when the shell wrapper next runs 'claude' here"
+    else
+      ensure_active "$profile"
+    fi
   fi
 }
 
@@ -1189,19 +1419,136 @@ cmd_rename() {
   printf 'renamed profile: %s -> %s\n' "$old" "$new"
 }
 
+cmd_isolate() {
+  [ $# -eq 1 ] || die "usage: $PROG isolate <name>"
+  valid_name "$1"
+  local name="$1" path blob store home was_active identity envelope tmp
+  path="$(profile_path "$name")"
+  [ -f "$path" ] || die "no such profile: $name"
+  [ "$(profile_mode "$path")" = "isolated" ] && die "profile '$name' is already isolated"
+
+  lock_acquire
+  # Pull in any token Claude rotated so the home starts from the freshest
+  # credentials we can get.
+  snapshot_active_profile
+
+  blob="$(profile_blob "$path")"
+  if [ -z "$blob" ] || [ "$blob" = "null" ]; then
+    die "profile '$name' has no credential blob (corrupt file?)"
+  fi
+  blob_has_credential "$blob" \
+    || die "profile '$name' has no Claude login in it - log in as that account, '$PROG save $name', then isolate"
+  store="$(profile_store "$path")"
+  home="$(home_for "$name")"
+  [ -e "$home" ] && die "home directory already exists: $home"
+  was_active="$(active_profile_name)"
+
+  ( umask 077; mkdir -p "$home" )
+  identity="$(jq -c '.identity // null' "$path")"
+  seed_home_claude_json "$home" "$identity"
+  isolated_creds_write "$home" "$blob" "$store"
+
+  envelope="$(build_isolated_envelope "$home")"
+  tmp="$(mktemp_for "$path")"
+  printf '%s\n' "$envelope" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$path"
+
+  # If this account was the live global login, the global store and the
+  # home now hold the SAME refresh token. Whichever refreshes first
+  # invalidates the other's copy, so the global login has to go.
+  if [ "$was_active" = "$name" ]; then
+    creds_clear_keychain
+    creds_clear_file
+    state_remove_api_key
+    state_remove_oauth_identity
+    clear_active_record
+    info "cleared the global login - it now lives only in the profile's home"
+  fi
+
+  printf 'isolated profile: %s\n' "$name"
+  printf '  home: %s\n' "$home"
+  printf "run 'claude' via the shell wrapper in a linked dir, or load it manually:\n"
+  printf '  %s env %s\n' "$PROG" "$name"
+}
+
+cmd_env() {
+  local shell=""
+  if [ "${1:-}" = "--shell" ]; then
+    [ $# -ge 2 ] || die "--shell requires a name"
+    shell="$2"
+    shift 2
+  fi
+  [ $# -eq 1 ] || die "usage: $PROG env [--shell fish|bash|zsh] <name>"
+  valid_name "$1"
+  local path home
+  path="$(profile_path "$1")"
+  [ -f "$path" ] || die "no such profile: $1"
+  [ "$(profile_mode "$path")" = "isolated" ] \
+    || die "profile '$1' is not isolated - use '$PROG use $1' instead"
+  home="$(profile_home "$path")"
+  [ -d "$home" ] || die "home directory is missing: $home"
+  [ -n "$shell" ] || case "$(basename "${SHELL:-}")" in
+    fish) shell=fish ;;
+    *)    shell=bash ;;
+  esac
+  case "$shell" in
+    fish)
+      printf "set -gx CLAUDE_CONFIG_DIR '%s'\n" "$home"
+      printf "set -gx CLAUDE_SECURESTORAGE_CONFIG_DIR '%s'\n" "$home"
+      printf "# apply with:  %s env --shell fish %s | source\n" "$PROG" "$1"
+      ;;
+    bash|zsh)
+      printf "export CLAUDE_CONFIG_DIR='%s'\n" "$home"
+      printf "export CLAUDE_SECURESTORAGE_CONFIG_DIR='%s'\n" "$home"
+      printf "# apply with:  eval \"\$(%s env --shell %s %s)\"\n" "$PROG" "$shell" "$1"
+      ;;
+    *) die "usage: $PROG env [--shell fish|bash|zsh] <name>" ;;
+  esac
+}
+
 cmd_show() {
   local json=0
   if [ "${1:-}" = "--json" ]; then json=1; shift; fi
   [ $# -eq 1 ] || die "usage: $PROG show [--json] <name>"
   valid_name "$1"
-  local path fp
+  local path fp mode home
   path="$(profile_path "$1")"
   [ -f "$path" ] || die "no such profile: $1"
-  # Metadata only - never print the blob itself.
+  mode="$(profile_mode "$path")"
+  # Metadata only - never print the blob or the home's credentials.
+  if [ "$mode" = "isolated" ]; then
+    home="$(profile_home "$path")"
+    fp="$(isolated_creds_read "$home" 2>/dev/null | blob_fingerprint)"
+    if [ "$json" -eq 1 ]; then
+      jq -c --arg name "$1" --arg fp "$fp" \
+        --arg email "$(isolated_email "$home")" \
+        --arg tier "$(isolated_tier "$home")" \
+        '{name: $name, mode: "isolated", home: .home,
+          email: (if $email == "" then null else $email end),
+          tier: (if $tier == "?" then null else $tier end),
+          saved_at: .saved_at,
+          fingerprint: (if $fp == "" then null else $fp end)}' \
+        "$path"
+      return
+    fi
+    jq -r --arg name "$1" --arg fp "$fp" \
+      --arg email "$(isolated_email "$home")" \
+      --arg tier "$(isolated_tier "$home")" '
+      "name:        \($name)",
+      "mode:        isolated",
+      "home:        \(.home)",
+      "email:       \(if $email == "" then "-" else $email end)",
+      "tier:        \($tier)",
+      "created at:  \(.saved_at)",
+      "fingerprint: \(if $fp == "" then "(none - no login in the home?)" else $fp end)"
+    ' "$path"
+    return
+  fi
   fp="$(profile_blob "$path" | blob_fingerprint)"
   if [ "$json" -eq 1 ]; then
     jq -c --arg name "$1" --arg fp "$fp" \
-      '{name: $name,
+      '{name: $name, mode: "blob",
         email: (if .email == "" then null else .email end),
         tier: (if .tier == "?" then null else .tier end),
         store: (if .store == "" then null else .store end),
@@ -1214,6 +1561,7 @@ cmd_show() {
   fi
   jq -r --arg name "$1" --arg fp "$fp" '
     "name:              \($name)",
+    "mode:              blob",
     "email:             \(if .email == "" then "-" else .email end)",
     "tier:              \(.tier)",
     "store:             \(if .store == "" then "-" else .store end)",
@@ -1247,10 +1595,44 @@ cmd_default() {
 }
 
 cmd_add() {
-  [ $# -eq 1 ] || die "usage: $PROG add <name>"
+  local isolated=0
+  if [ "${1:-}" = "--isolated" ]; then isolated=1; shift; fi
+  [ $# -eq 1 ] || die "usage: $PROG add [--isolated] <name>"
   valid_name "$1"
   local name="$1"
   [ -e "$(profile_path "$name")" ] && die "profile '$name' already exists"
+
+  if [ "$isolated" -eq 1 ]; then
+    local home envelope
+    home="$(home_for "$name")"
+    [ -e "$home" ] && die "home directory already exists: $home"
+    ( umask 077; mkdir -p "$home" )
+    seed_home_claude_json "$home" null
+
+    echo "I'll launch Claude Code in the profile's own config dir."
+    echo "  1. /login as the NEW account (no /logout needed - the dir is fresh)"
+    echo "  2. quit Claude Code"
+    printf 'press Enter to continue... '
+    IFS= read -r _ </dev/tty || true
+
+    run_claude_bypassed "$home" || true
+
+    local creds
+    creds="$(isolated_creds_read "$home" 2>/dev/null || true)"
+    if [ -z "$creds" ] || ! blob_has_credential "$creds"; then
+      rm -rf -- "$home"
+      die "no login was completed in the new home; aborting"
+    fi
+    lock_acquire
+    envelope="$(build_isolated_envelope "$home")"
+    ( umask 077; printf '%s\n' "$envelope" > "$(profile_path "$name")" )
+    printf 'added isolated profile: %s' "$name"
+    local email
+    email="$(isolated_email "$home")"
+    [ -n "$email" ] && printf ' (%s)' "$email"
+    printf '\n'
+    return 0
+  fi
 
   echo "I'll launch Claude Code now (wrapper bypassed)."
   echo "  1. /logout"
@@ -1284,7 +1666,7 @@ cmd_ensure() {
     if [ ! -f "$(profile_path "$val")" ]; then
       info "mapping points to missing profile '$val'; falling through"
     else
-      ensure_active "$val"
+      apply_profile "$val"
       return 0
     fi
   fi
@@ -1292,7 +1674,7 @@ cmd_ensure() {
   local default_name
   default_name="$(get_default)"
   if [ -n "$default_name" ] && [ -f "$(profile_path "$default_name")" ]; then
-    ensure_active "$default_name"
+    apply_profile "$default_name"
     return 0
   fi
 
@@ -1310,8 +1692,15 @@ function claude --description 'claude with claudeswitch per-repo auto-switching'
         return
     end
     if command -q claudeswitch
-        if not claudeswitch ensure
+        # ensure prints a config dir for isolated profiles, nothing for
+        # blob profiles (which it switches into the global store).
+        set -l clsw_dir (claudeswitch ensure)
+        if test $status -ne 0
             return 1
+        end
+        if test -n "$clsw_dir"
+            env CLAUDE_CONFIG_DIR=$clsw_dir CLAUDE_SECURESTORAGE_CONFIG_DIR=$clsw_dir claude $argv
+            return
         end
     end
     command claude $argv
@@ -1326,7 +1715,14 @@ claude() {
     return
   fi
   if command -v claudeswitch >/dev/null 2>&1; then
-    claudeswitch ensure || return 1
+    # ensure prints a config dir for isolated profiles, nothing for
+    # blob profiles (which it switches into the global store).
+    local clsw_dir
+    clsw_dir="$(claudeswitch ensure)" || return 1
+    if [ -n "$clsw_dir" ]; then
+      CLAUDE_CONFIG_DIR="$clsw_dir" CLAUDE_SECURESTORAGE_CONFIG_DIR="$clsw_dir" command claude "$@"
+      return
+    fi
   fi
   command claude "$@"
 }
@@ -1397,6 +1793,21 @@ cmd_doctor() {
     name="$(basename "$f" .json)"
     if ! jq -e . "$f" >/dev/null 2>&1; then
       _fail "profile '$name' is not valid JSON: $f"
+      continue
+    fi
+    if [ "$(profile_mode "$f")" = "isolated" ]; then
+      local ihome icreds
+      ihome="$(profile_home "$f")"
+      if [ ! -d "$ihome" ]; then
+        _fail "isolated profile '$name' is missing its home: $ihome"
+        continue
+      fi
+      icreds="$(isolated_creds_read "$ihome" 2>/dev/null || true)"
+      if [ -z "$icreds" ] || ! blob_has_credential "$icreds"; then
+        _fail "isolated profile '$name' has no login in its home - run 'claude' there via '$PROG env $name' and /login"
+        continue
+      fi
+      _ok "isolated profile '$name' looks healthy"
       continue
     fi
     pblob="$(profile_blob "$f")"
@@ -1474,8 +1885,8 @@ cmd_doctor() {
 
 cmd_completions() {
   local shell="${1:-}"
-  local subcmds="save add use list current show rename paths rm link unlink links which default doctor init-shell completions version help"
-  local profile_cmds="use rm show rename link default"
+  local subcmds="save add use isolate env list current show rename paths rm link unlink links which default doctor init-shell completions version help"
+  local profile_cmds="use rm show rename link default isolate env"
   case "$shell" in
     fish)
       local prog
@@ -1499,7 +1910,7 @@ _claudeswitch() {
     return
   fi
   case "\${COMP_WORDS[1]}" in
-    use|rm|show|rename|link|default)
+    use|rm|show|rename|link|default|isolate|env)
       COMPREPLY=(\$(compgen -W "\$(claudeswitch _profiles 2>/dev/null)" -- "\$cur")) ;;
     init-shell|completions)
       COMPREPLY=(\$(compgen -W "fish bash zsh" -- "\$cur")) ;;
@@ -1528,8 +1939,13 @@ $PROG - manage Claude Code CLI logins (alias: clsw)
 
 profile management:
   $PROG save <name>            snapshot the current login as <name>
-  $PROG add  <name>            log in as a new account, then save it as <name>
+  $PROG add  [--isolated] <name>
+                               log in as a new account, then save it as <name>
   $PROG use  <name>            make <name> the active login
+  $PROG isolate <name>         give <name> its own Claude config dir, so it can
+                               run concurrently with other profiles
+  $PROG env [--shell <s>] <name>
+                               print env exports to run an isolated profile
   $PROG list [--json]          list saved profiles (marks active with *)
   $PROG current [--json]       print the active profile
   $PROG show [--json] <name>   print a profile's metadata (never the tokens)
@@ -1568,6 +1984,8 @@ case "$cmd" in
   save)               cmd_save       "$@" ;;
   add)                cmd_add        "$@" ;;
   use|switch)         cmd_use        "$@" ;;
+  isolate)            cmd_isolate    "$@" ;;
+  env)                cmd_env        "$@" ;;
   list|ls)            cmd_list       "$@" ;;
   current|who)        cmd_current    "$@" ;;
   show|info)          cmd_show       "$@" ;;

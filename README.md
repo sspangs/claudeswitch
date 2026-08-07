@@ -59,8 +59,12 @@ ln -s "$PWD/claudeswitch" ~/.local/bin/clsw
 
 ```
 clsw save <name>            snapshot the current login as <name>
-clsw add  <name>            log in as a new account, then save it as <name>
+clsw add  [--isolated] <name>
+                            log in as a new account, then save it as <name>
 clsw use  <name>            make <name> the active login
+clsw isolate <name>         give <name> its own Claude config dir (see below)
+clsw env [--shell <s>] <name>
+                            print env exports to run an isolated profile
 clsw list                   list saved profiles (marks active with *)
 clsw current                print the active profile
 clsw show <name>            print a profile's metadata (never the tokens)
@@ -213,6 +217,54 @@ CLAUDE_SWITCH_BYPASS=1 claude
 in, so you can safely `add` a new profile from inside any managed
 directory.
 
+## Isolated profiles
+
+By default a profile is a snapshot of the one global login ("blob" mode):
+switching rewrites the credential store, running sessions have to be
+restarted, and only one account can be live at a time.
+
+An **isolated** profile instead owns a whole Claude config dir of its own
+under `~/.config/claudeswitch/homes/<name>`. The shell wrapper launches
+`claude` with `CLAUDE_CONFIG_DIR` pointing at it, which means:
+
+- **Concurrent accounts.** A work repo in one terminal and a personal
+  repo in another each run as their own account, at the same time.
+- **No restarts.** Switching directories never rewrites the global
+  credential store, so nothing needs restarting.
+- **No token-rotation fragility.** Each account's tokens live in exactly
+  one place; there is nothing to snapshot or drift.
+
+```sh
+clsw isolate work        # convert an existing profile
+clsw add --isolated ops  # or create a new one, isolated from the start
+clsw link work ~/src/acme-api
+cd ~/src/acme-api && claude    # runs inside work's own config dir
+```
+
+Without the wrapper (or in scripts), load one into the current shell:
+
+```sh
+eval "$(clsw env work)"        # bash/zsh
+clsw env --shell fish work | source   # fish
+```
+
+The tradeoff: an isolated home is a separate Claude Code world.
+Session history, per-user settings, and MCP logins live inside it, not
+in `~/.claude`. `clsw isolate` seeds the new home with your theme and
+onboarding state, but the rest starts fresh.
+
+Two behaviors worth knowing:
+
+- Isolating the profile you're currently logged in as also logs out the
+  global store. Both copies would otherwise hold the same refresh token,
+  and whichever refreshed first would invalidate the other.
+- `clsw rm` on an isolated profile deletes the only copy of that login
+  (and its per-profile history), so it asks first.
+
+If you installed the wrapper before v0.3.0, re-run `./install.sh` (or
+re-eval `clsw init-shell <shell>`) - the old wrapper doesn't know how to
+put `claude` inside a profile's home.
+
 ## How it works
 
 Claude Code stores its OAuth credentials as a single JSON blob. That blob -
@@ -262,6 +314,7 @@ State lives in `~/.config/claudeswitch/`:
 
 ```
 profiles/<name>.json   # per-profile snapshot (mode 0600)
+homes/<name>/          # isolated profiles: that profile's CLAUDE_CONFIG_DIR
 repos.json             # { "/abs/repo/path": "profile_name_or_-" }
 default                # single line: default profile name
 active                 # single line: last profile activated or saved
@@ -272,8 +325,9 @@ state.
 
 ## Caveats
 
-- **Restart `claude` after switching.** A running session holds its tokens
-  in memory and won't notice the credential change until it's restarted.
+- **Restart `claude` after switching blob profiles.** A running session
+  holds its tokens in memory and won't notice the credential change until
+  it's restarted. (Isolated profiles don't have this problem.)
 - **Profile files contain live OAuth tokens.** They're written with mode
   `0600`, but treat `~/.config/claudeswitch/` the same way you'd treat
   `~/.ssh/` - don't commit it, don't sync it to places you don't trust.
