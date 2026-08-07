@@ -11,7 +11,7 @@ setup() {
 @test "version prints the version" {
   run "$CLSW" version
   [ "$status" -eq 0 ]
-  [[ "$output" == "claudeswitch "* ]]
+  assert_starts_with "$output" "claudeswitch "
   run "$CLSW" --version
   [ "$status" -eq 0 ]
 }
@@ -27,9 +27,9 @@ setup() {
 
   run "$CLSW" links
   [ "$status" -eq 0 ]
-  [[ "$output" == *"$HOME/repo1 -> alice"* ]]
-  [[ "$output" == *"$HOME/repo2 -> (unmanaged)"* ]]
-  [[ "$output" == *"$HOME/repo3 -> ghost  (missing profile)"* ]]
+  assert_contains "$output" "$HOME/repo1 -> alice"
+  assert_contains "$output" "$HOME/repo2 -> (unmanaged)"
+  assert_contains "$output" "$HOME/repo3 -> ghost  (missing profile)"
 }
 
 @test "links with no mappings says so" {
@@ -71,21 +71,21 @@ setup() {
   make_profile bob B bob@example.com
   run "$CLSW" rename alice bob
   [ "$status" -eq 1 ]
-  [[ "$output" == *"already exists"* ]]
+  assert_contains "$output" "already exists"
   run "$CLSW" rename ghost new
   [ "$status" -eq 1 ]
-  [[ "$output" == *"no such profile"* ]]
+  assert_contains "$output" "no such profile"
 }
 
 @test "show prints metadata but never the tokens" {
   make_profile alice A alice@example.com
   run "$CLSW" show alice
   [ "$status" -eq 0 ]
-  [[ "$output" == *"alice@example.com"* ]]
-  [[ "$output" == *"store:             file"* ]]
-  [[ "$output" == *"identity snapshot: yes"* ]]
-  [[ "$output" != *"rt-A"* ]]
-  [[ "$output" != *"at-A"* ]]
+  assert_contains "$output" "alice@example.com"
+  assert_contains "$output" "store:             file"
+  assert_contains "$output" "identity snapshot: yes"
+  assert_not_contains "$output" "rt-A"
+  assert_not_contains "$output" "at-A"
 }
 
 @test "show --json emits metadata without the blob" {
@@ -96,7 +96,7 @@ setup() {
   [ "$(printf '%s' "$output" | jq -r '.email')" = "alice@example.com" ]
   [ "$(printf '%s' "$output" | jq -r '.identity_snapshot')" = "true" ]
   [ "$(printf '%s' "$output" | jq -r 'has("blob")')" = "false" ]
-  [[ "$output" != *"rt-A"* ]]
+  assert_not_contains "$output" "rt-A"
 }
 
 @test "current --json covers active, unsaved, and none" {
@@ -148,10 +148,10 @@ setup() {
   make_profile alice A alice@example.com
   run "$CLSW" doctor
   [ "$status" -eq 0 ]
-  [[ "$output" == *"live login present"* ]]
-  [[ "$output" == *"live login matches profile: alice"* ]]
-  [[ "$output" == *"profile 'alice' looks healthy"* ]]
-  [[ "$output" == *"0 problems"* ]]
+  assert_contains "$output" "live login present"
+  assert_contains "$output" "live login matches profile: alice"
+  assert_contains "$output" "profile 'alice' looks healthy"
+  assert_contains "$output" "0 problems"
 }
 
 @test "doctor fails on a corrupt profile" {
@@ -160,8 +160,8 @@ setup() {
   echo 'not json' > "$(profile_file broken)"
   run "$CLSW" doctor
   [ "$status" -eq 1 ]
-  [[ "$output" == *"FAIL: profile 'broken' is not valid JSON"* ]]
-  [[ "$output" == *"1 problem(s)"* ]]
+  assert_contains "$output" "FAIL: profile 'broken' is not valid JSON"
+  assert_contains "$output" "1 problem(s)"
 }
 
 @test "doctor flags a credential-less profile" {
@@ -169,7 +169,7 @@ setup() {
     > "$(mkdir -p "$CLSW_ROOT/profiles" && profile_file empty)"
   run "$CLSW" doctor
   [ "$status" -eq 1 ]
-  [[ "$output" == *"FAIL: profile 'empty' holds no Claude login"* ]]
+  assert_contains "$output" "FAIL: profile 'empty' holds no Claude login"
 }
 
 @test "doctor warns about broken mappings, missing default, stale lock" {
@@ -179,24 +179,24 @@ setup() {
   mkdir -p "$CLSW_ROOT/.lock"
   run "$CLSW" doctor
   [ "$status" -eq 0 ]
-  [[ "$output" == *"points at a missing profile"* ]]
-  [[ "$output" == *"mapped directory no longer exists"* ]]
-  [[ "$output" == *"default profile 'ghost' does not exist"* ]]
-  [[ "$output" == *"stale lock"* ]]
+  assert_contains "$output" "points at a missing profile"
+  assert_contains "$output" "mapped directory no longer exists"
+  assert_contains "$output" "default profile 'ghost' does not exist"
+  assert_contains "$output" "stale lock"
   rm -rf "$CLSW_ROOT/.lock"
 }
 
 @test "completions emit for each shell and reject others" {
   run "$CLSW" completions fish
   [ "$status" -eq 0 ]
-  [[ "$output" == *"complete -c clsw"* ]]
-  [[ "$output" == *"__fish_seen_subcommand_from"* ]]
+  assert_contains "$output" "complete -c clsw"
+  assert_contains "$output" "__fish_seen_subcommand_from"
   run "$CLSW" completions bash
   [ "$status" -eq 0 ]
-  [[ "$output" == *"complete -F _claudeswitch claudeswitch clsw"* ]]
+  assert_contains "$output" "complete -F _claudeswitch claudeswitch clsw"
   run "$CLSW" completions zsh
   [ "$status" -eq 0 ]
-  [[ "$output" == *"bashcompinit"* ]]
+  assert_contains "$output" "bashcompinit"
   run "$CLSW" completions
   [ "$status" -eq 1 ]
 }

@@ -37,6 +37,48 @@ use_macos() { export FAKE_UNAME=Darwin; }
 
 profile_file() { printf '%s/profiles/%s.json' "$CLSW_ROOT" "$1"; }
 
+# --- assertions ------------------------------------------------------------
+# bash 3.2 (macOS /bin/bash) has an errexit bug: a failing bare [[ ]] does
+# NOT abort the test, so [[-based assertions silently pass. These helpers
+# are plain commands - their failure always propagates - and they print
+# the expectation and the actual text on mismatch.
+
+assert_contains() {  # $1 = haystack, $2 = needle
+  case "$1" in *"$2"*) return 0 ;; esac
+  { echo "expected to contain: $2"; echo "actual:"; printf '%s\n' "$1"; } >&2
+  return 1
+}
+
+assert_not_contains() {  # $1 = haystack, $2 = needle
+  case "$1" in
+    *"$2"*)
+      { echo "expected NOT to contain: $2"; echo "actual:"; printf '%s\n' "$1"; } >&2
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+assert_starts_with() {  # $1 = text, $2 = prefix
+  case "$1" in "$2"*) return 0 ;; esac
+  { echo "expected to start with: $2"; echo "actual:"; printf '%s\n' "$1"; } >&2
+  return 1
+}
+
+assert_line_matches() {  # $1 = text, $2 = ERE matched against any line
+  if printf '%s\n' "$1" | grep -qE "$2"; then return 0; fi
+  { echo "expected a line matching: $2"; echo "actual:"; printf '%s\n' "$1"; } >&2
+  return 1
+}
+
+assert_no_line_matches() {  # $1 = text, $2 = ERE
+  if printf '%s\n' "$1" | grep -qE "$2"; then
+    { echo "expected no line matching: $2"; echo "actual:"; printf '%s\n' "$1"; } >&2
+    return 1
+  fi
+  return 0
+}
+
 # --- fixtures --------------------------------------------------------------
 
 # A syntactically realistic OAuth credential blob; $1 seeds the tokens so

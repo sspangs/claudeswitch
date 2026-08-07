@@ -18,16 +18,16 @@ setup() {
   write_identity alice@example.com
   run "$CLSW" current
   [ "$status" -eq 0 ]
-  [[ "$output" == *"(unsaved - alice@example.com)"* ]]
+  assert_contains "$output" "(unsaved - alice@example.com)"
 }
 
 @test "current matches the active profile by fingerprint" {
   make_profile alice A alice@example.com
   run "$CLSW" current
   [ "$status" -eq 0 ]
-  [[ "$output" == *"alice"* ]]
-  [[ "$output" == *"alice@example.com"* ]]
-  [[ "$output" == *"[max]"* ]]
+  assert_contains "$output" "alice"
+  assert_contains "$output" "alice@example.com"
+  assert_contains "$output" "[max]"
 }
 
 @test "current falls back to the cached email when the token rotated" {
@@ -35,7 +35,7 @@ setup() {
   write_creds_file "$(oauth_blob A2)"
   run "$CLSW" current
   [ "$status" -eq 0 ]
-  [[ "$output" == alice* ]]
+  assert_starts_with "$output" "alice"
 }
 
 @test "current treats conflicting email and active record as unknown" {
@@ -48,7 +48,7 @@ setup() {
   write_identity alice@example.com
   run "$CLSW" current
   [ "$status" -eq 0 ]
-  [[ "$output" == *"(unsaved - alice@example.com)"* ]]
+  assert_contains "$output" "(unsaved - alice@example.com)"
 }
 
 @test "ambiguous email is resolved by the active record" {
@@ -60,7 +60,7 @@ setup() {
   write_identity shared@example.com
   run "$CLSW" current
   [ "$status" -eq 0 ]
-  [[ "$output" == personal* ]]
+  assert_starts_with "$output" "personal"
 }
 
 @test "a credential-less live blob matches no profile" {
@@ -68,7 +68,7 @@ setup() {
   write_creds_file '{"mcpOAuth":{}}'
   run "$CLSW" current
   [ "$status" -eq 0 ]
-  [[ "$output" == *"(unsaved"* ]]
+  assert_contains "$output" "(unsaved"
 }
 
 @test "list shows all profiles, marks active and default" {
@@ -78,16 +78,15 @@ setup() {
   [ "$status" -eq 0 ]
   run "$CLSW" list
   [ "$status" -eq 0 ]
-  [[ "$output" == *"NAME"* ]]
-  [[ "$output" == *"* bob"* ]]
-  local alice_line
-  alice_line="$(printf '%s\n' "$output" | grep ' alice ')"
-  [[ "$alice_line" == *"default"* ]]
-  [[ "$alice_line" != "*"* ]]
+  assert_contains "$output" "NAME"
+  # bob is active: his line carries the * mark; alice's must not.
+  assert_line_matches "$output" '^ *\* +bob '
+  assert_no_line_matches "$output" '^ *\* +alice '
+  assert_line_matches "$output" '^ +alice .* default'
 }
 
 @test "list with no profiles prints a hint" {
   run "$CLSW" list
   [ "$status" -eq 0 ]
-  [[ "$output" == *"no saved profiles"* ]]
+  assert_contains "$output" "no saved profiles"
 }

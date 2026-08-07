@@ -31,26 +31,26 @@ setup() {
 @test "link refuses a missing profile" {
   run "$CLSW" link ghost "$REPO"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"no such profile: ghost"* ]]
+  assert_contains "$output" "no such profile: ghost"
 }
 
 @test "unlink removes the mapping" {
   run "$CLSW" link alice "$REPO"
   run "$CLSW" unlink "$REPO"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"unlinked"* ]]
+  assert_contains "$output" "unlinked"
   [ "$(jq -r --arg k "$REPO" 'has($k)' "$CLSW_ROOT/repos.json")" = "false" ]
 }
 
 @test "unlink without a mapping says so" {
   run "$CLSW" unlink "$REPO"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"no mapping"* ]]
+  assert_contains "$output" "no mapping"
 }
 
 @test "which reports linked, inherited, default, and none" {
   run "$CLSW" which "$REPO"
-  [[ "$output" == *"no mapping, no default"* ]]
+  assert_contains "$output" "no mapping, no default"
 
   run "$CLSW" link alice "$REPO"
   run "$CLSW" which "$REPO"
@@ -86,14 +86,14 @@ setup() {
 @test "default refuses a missing profile" {
   run "$CLSW" default ghost
   [ "$status" -eq 1 ]
-  [[ "$output" == *"no such profile: ghost"* ]]
+  assert_contains "$output" "no such profile: ghost"
 }
 
 @test "ensure switches to the mapped profile" {
   run "$CLSW" link alice "$REPO"
   run "$CLSW" ensure "$REPO"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"switched to profile: alice"* ]]
+  assert_contains "$output" "switched to profile: alice"
   [ "$(cat "$CREDS_FILE")" = "$(oauth_blob A)" ]
 }
 
@@ -118,15 +118,15 @@ setup() {
   run "$CLSW" default alice
   run "$CLSW" ensure "$REPO"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"missing profile 'ghost'"* ]]
-  [[ "$output" == *"switched to profile: alice"* ]]
+  assert_contains "$output" "missing profile 'ghost'"
+  assert_contains "$output" "switched to profile: alice"
 }
 
 @test "ensure uses the default for unmapped dirs" {
   run "$CLSW" default alice
   run "$CLSW" ensure "$REPO"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"switched to profile: alice"* ]]
+  assert_contains "$output" "switched to profile: alice"
 }
 
 @test "ensure warns when a linked profile file disappeared" {
@@ -135,5 +135,5 @@ setup() {
   run "$CLSW" default bob
   run "$CLSW" ensure "$REPO"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"falling through"* ]]
+  assert_contains "$output" "falling through"
 }

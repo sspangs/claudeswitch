@@ -315,6 +315,11 @@ dirs point into a temp dir, and fake `uname` and `security` binaries in
 Linux file path on any host. No test can touch your real credentials.
 CI runs the suite on Ubuntu and macOS for every push and PR.
 
+Tests must use the `assert_*` helpers from `tests/helpers/common.bash`
+instead of bare `[[ ]]`: bash 3.2 (macOS `/bin/bash`, which runs the
+suite there) has an errexit bug that silently ignores a failing `[[ ]]`,
+turning such assertions into no-ops. `make lint` enforces this.
+
 ## Uninstall
 
 ```sh

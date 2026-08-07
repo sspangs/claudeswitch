@@ -10,13 +10,13 @@ setup() {
 @test "save refuses when no login exists" {
   run "$CLSW" save alice
   [ "$status" -eq 1 ]
-  [[ "$output" == *"no active Claude Code login"* ]]
+  assert_contains "$output" "no active Claude Code login"
 }
 
 @test "save rejects invalid profile names" {
   run "$CLSW" save 'bad/name'
   [ "$status" -eq 1 ]
-  [[ "$output" == *"invalid profile name"* ]]
+  assert_contains "$output" "invalid profile name"
 }
 
 @test "save captures blob, email, tier, store, and identity" {
@@ -27,7 +27,7 @@ setup() {
 
   run "$CLSW" save alice
   [ "$status" -eq 0 ]
-  [[ "$output" == *"saved profile: alice (alice@example.com)"* ]]
+  assert_contains "$output" "saved profile: alice (alice@example.com)"
 
   local f
   f="$(profile_file alice)"
@@ -50,7 +50,7 @@ setup() {
   write_identity alice@example.com
   run "$CLSW" save alice
   [ "$status" -eq 1 ]
-  [[ "$output" == *"no Claude login"* ]]
+  assert_contains "$output" "no Claude login"
   [ ! -f "$(profile_file alice)" ]
 }
 
@@ -67,7 +67,7 @@ setup() {
   # stdin closed: if save prompted, the read would fail and abort.
   run bash -c "'$CLSW' save alice </dev/null"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"saved profile: alice"* ]]
+  assert_contains "$output" "saved profile: alice"
 }
 
 @test "overwriting with a different account prompts, and 'n' aborts" {
@@ -76,7 +76,7 @@ setup() {
   write_identity bob@example.com
   run bash -c "printf 'n\n' | '$CLSW' save alice"
   [ "$status" -eq 1 ]
-  [[ "$output" == *"aborted"* ]]
+  assert_contains "$output" "aborted"
   [ "$(jq -r '.email' "$(profile_file alice)")" = "alice@example.com" ]
 }
 

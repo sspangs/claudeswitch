@@ -52,5 +52,5 @@ setup() {
   write_creds_file "$(oauth_blob X)"
   run "$CLSW" current
   [ "$status" -eq 0 ]
-  [[ "$output" == *"(unsaved"* ]]
+  assert_contains "$output" "(unsaved"
 }

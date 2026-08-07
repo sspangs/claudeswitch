@@ -13,7 +13,7 @@ setup() {
 
   run "$CLSW" use alice
   [ "$status" -eq 0 ]
-  [[ "$output" == *"switched to profile: alice"* ]]
+  assert_contains "$output" "switched to profile: alice"
   [ "$(cat "$CREDS_FILE")" = "$(oauth_blob A)" ]
   [ "$(jq -r '.oauthAccount.emailAddress' "$CLAUDE_JSON_PATH")" = "alice@example.com" ]
   [ "$(jq -r '.userID' "$CLAUDE_JSON_PATH")" = "uid-alice@example.com" ]
@@ -31,7 +31,7 @@ setup() {
 
   run "$CLSW" use bob
   [ "$status" -eq 0 ]
-  [[ "$output" == *"snapshotted refreshed credentials into profile: alice"* ]]
+  assert_contains "$output" "snapshotted refreshed credentials into profile: alice"
   [ "$(jq -r '.blob' "$(profile_file alice)")" = "$(oauth_blob A2)" ]
   [ "$(cat "$CREDS_FILE")" = "$(oauth_blob B)" ]
 }
@@ -39,7 +39,7 @@ setup() {
 @test "use refuses a missing profile" {
   run "$CLSW" use ghost
   [ "$status" -eq 1 ]
-  [[ "$output" == *"no such profile: ghost"* ]]
+  assert_contains "$output" "no such profile: ghost"
 }
 
 @test "use refuses a profile whose blob has no Claude login" {
@@ -48,7 +48,7 @@ setup() {
     > "$(profile_file broken)"
   run "$CLSW" use broken
   [ "$status" -eq 1 ]
-  [[ "$output" == *"has no Claude login"* ]]
+  assert_contains "$output" "has no Claude login"
 }
 
 @test "use without an identity snapshot clears the stale cached identity" {
@@ -61,7 +61,7 @@ setup() {
 
   run "$CLSW" use alice
   [ "$status" -eq 0 ]
-  [[ "$output" == *"no identity snapshot"* ]]
+  assert_contains "$output" "no identity snapshot"
   [ "$(jq -r '.oauthAccount' "$CLAUDE_JSON_PATH")" = "null" ]
   [ "$(jq -r '.hasAvailableSubscription' "$CLAUDE_JSON_PATH")" = "false" ]
 }
@@ -88,5 +88,5 @@ setup() {
 @test "rm refuses a missing profile" {
   run "$CLSW" rm ghost
   [ "$status" -eq 1 ]
-  [[ "$output" == *"no such profile: ghost"* ]]
+  assert_contains "$output" "no such profile: ghost"
 }

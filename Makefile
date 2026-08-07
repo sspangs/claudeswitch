@@ -8,5 +8,9 @@ test:
 
 lint:
 	shellcheck claudeswitch install.sh
+	@if grep -n '\[\[' tests/*.bats; then \
+	  echo 'error: bare [[ ]] in tests - bash 3.2 errexit ignores its failures; use the assert_* helpers' >&2; \
+	  exit 1; \
+	fi
 
 check: lint test

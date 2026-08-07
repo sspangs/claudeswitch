@@ -20,7 +20,7 @@ setup() {
 
   run "$CLSW" save alice
   [ "$status" -eq 0 ]
-  [[ "$output" == *"saved profile: alice"* ]]
+  assert_contains "$output" "saved profile: alice"
   [ ! -d "$LOCK_DIR" ]
 }
 
@@ -30,8 +30,8 @@ setup() {
 
   CLAUDESWITCH_LOCK_TIMEOUT=1 run "$CLSW" save alice
   [ "$status" -eq 1 ]
-  [[ "$output" == *"timed out waiting for lock"* ]]
-  [[ "$output" == *"$LOCK_DIR"* ]]
+  assert_contains "$output" "timed out waiting for lock"
+  assert_contains "$output" "$LOCK_DIR"
   rm -rf "$LOCK_DIR"
 }
 
@@ -40,7 +40,7 @@ setup() {
 
   CLAUDESWITCH_LOCK_TIMEOUT=1 run "$CLSW" save alice
   [ "$status" -eq 1 ]
-  [[ "$output" == *"timed out waiting for lock"* ]]
+  assert_contains "$output" "timed out waiting for lock"
   rm -rf "$LOCK_DIR"
 }
 
