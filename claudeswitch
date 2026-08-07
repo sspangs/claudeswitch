@@ -876,7 +876,9 @@ cmd_use() {
   path="$(profile_path "$1")"
   [ -f "$path" ] || die "no such profile: $1"
   blob="$(profile_blob "$path")"
-  [ -n "$blob" ] && [ "$blob" != "null" ] || die "profile '$1' is missing a blob (corrupt file?)"
+  if [ -z "$blob" ] || [ "$blob" = "null" ]; then
+    die "profile '$1' is missing a blob (corrupt file?)"
+  fi
   blob_has_credential "$blob" \
     || die "profile '$1' has no Claude login in it (captured while logged out?) - log in as that account and run '$PROG save $1' to repair it"
   store="$(profile_store "$path")"
